@@ -1163,7 +1163,10 @@ class ReportAgent:
         if progress_callback:
             progress_callback("planning", 30, t('progress.generatingOutline'))
         
-        system_prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{get_language_instruction()}"
+        system_prompt = (
+            f"{PLAN_SYSTEM_PROMPT}\n\n{get_language_instruction()}"
+            "\n\nMANDATORY: THE ANSWER MUST BE IN ENGLISH"
+        )
         user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
             simulation_requirement=self.simulation_requirement,
             total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
@@ -1259,7 +1262,10 @@ class ReportAgent:
             section_title=section.title,
             tools_description=self._get_tools_description(),
         )
-        system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
+        system_prompt = (
+            f"{system_prompt}\n\n{get_language_instruction()}"
+            "\n\nMANDATORY: THE ANSWER MUST BE IN ENGLISH"
+        )
 
         # 构建用户prompt - 每个已完成章节各传入最大4000字
         if previous_sections:

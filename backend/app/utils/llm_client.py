@@ -18,15 +18,20 @@ class LLMClient:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model = model or Config.LLM_MODEL_NAME
-        
+        # Empty string is treated as "omit the param" so providers that don't
+        # accept reasoning_effort (Qwen, DeepSeek, older OpenAI models) still work.
+        effort = reasoning_effort if reasoning_effort is not None else Config.LLM_REASONING_EFFORT
+        self.reasoning_effort = effort or None
+
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
-        
+
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url
@@ -54,10 +59,43 @@ class LLMClient:
         kwargs = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
         }
-        
+
+        # OpenAI GPT-5 and o-series reasoning models reject the legacy
+        # `max_tokens` parameter and require `max_completion_tokens`. They
+        # also reject any non-default `temperature`, accepting only the
+        # model default (1). Other OpenAI-SDK-compatible providers (Qwen,
+        # DeepSeek, etc.) still use both `max_tokens` and `temperature`,
+        # so we gate these on the OpenAI reasoning family prefix.
+        model_lc = (self.model or "").lower()
+        is_reasoning_family = model_lc.startswith(("gpt-5", "o1", "o3", "o4"))
+        if is_reasoning_family:
+            # Reasoning tokens come out of the same `max_completion_tokens`
+            # budget as output tokens. If `reasoning_effort` is high/xhigh
+            # and the caller's budget is small (e.g. 4096), the model can
+            # consume the entire budget on internal reasoning and return
+            # empty content — which then fails downstream JSON parsing.
+            # We enforce a floor sized by effort to guarantee output room.
+            effort = (self.reasoning_effort or "").lower()
+            reasoning_floor = {
+                "xhigh": 32768,
+                "high": 16384,
+                "medium": 8192,
+                "low": 4096,
+                "minimal": 2048,
+                "none": 2048,
+            }.get(effort, 0)
+            kwargs["max_completion_tokens"] = max(max_tokens, reasoning_floor)
+        else:
+            kwargs["max_tokens"] = max_tokens
+            kwargs["temperature"] = temperature
+
+        # reasoning_effort is only supported by GPT-5 and o-series reasoning
+        # models. Forwarding it to Qwen/DeepSeek/etc. would error out, so we
+        # gate on the same family check as max_completion_tokens.
+        if self.reasoning_effort and is_reasoning_family:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+
         if response_format:
             kwargs["response_format"] = response_format
         

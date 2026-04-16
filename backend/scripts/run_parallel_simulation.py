@@ -1028,9 +1028,22 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
     
     if llm_base_url:
         os.environ["OPENAI_API_BASE_URL"] = llm_base_url
-    
+
+    # NOTE: We intentionally do NOT forward LLM_REASONING_EFFORT to the
+    # simulation-subprocess model. OASIS/camel-ai agents always attach
+    # function tools (CREATE_POST, LIKE_POST, etc.) to every turn, and
+    # OpenAI rejects `reasoning_effort` combined with function tools on
+    # the /v1/chat/completions endpoint for gpt-5.4-nano and similar
+    # models with:
+    #     "Function tools with reasoning_effort are not supported ...
+    #      Please use /v1/responses instead."
+    # Switching camel-ai to /v1/responses is a much larger change, so for
+    # the simulation path we deliberately omit the parameter. The Flask
+    # path (ontology, profile, config, report generation) does not send
+    # function tools to OpenAI, so reasoning_effort is still applied there
+    # via LLMClient.
     print(f"{config_label} model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else '默认'}...")
-    
+
     return ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
         model_type=llm_model,
