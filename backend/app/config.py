@@ -4,6 +4,8 @@
 """
 
 import os
+from typing import Literal
+
 from dotenv import load_dotenv
 
 # 加载项目根目录的 .env 文件
@@ -15,6 +17,14 @@ if os.path.exists(project_root_env):
 else:
     # 如果根目录没有 .env，尝试加载环境变量（用于生产环境）
     load_dotenv(override=True)
+
+
+# Default values for the global LLM_* env vars. Centralised here so the
+# class attributes (``Config.LLM_BASE_URL`` / ``Config.LLM_MODEL_NAME``) and
+# the per-role resolver (``Config.llm_for``) cannot drift apart when a
+# default is updated.
+DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_LLM_MODEL_NAME = "gpt-4o-mini"
 
 
 class Config:
@@ -29,8 +39,8 @@ class Config:
     
     # LLM配置（统一使用OpenAI格式）
     LLM_API_KEY = os.environ.get('LLM_API_KEY')
-    LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
-    LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
+    LLM_BASE_URL = os.environ.get('LLM_BASE_URL', DEFAULT_LLM_BASE_URL)
+    LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', DEFAULT_LLM_MODEL_NAME)
     # Reasoning effort for GPT-5 / o-series / gpt-5.4-* models.
     # Valid values: none, minimal, low, medium, high, xhigh.
     # Empty string means the parameter is omitted from requests (model default).
@@ -76,4 +86,50 @@ class Config:
         if not cls.ZEP_API_KEY:
             errors.append("ZEP_API_KEY 未配置")
         return errors
+
+    @classmethod
+    def llm_for(
+        cls, role: Literal["builder", "swarm", "judge"]
+    ) -> tuple[str | None, str, str]:
+        """Resolve the (api_key, base_url, model) triple for a given role.
+
+        Each role looks up its prefixed env-var group
+        (``BUILDER_LLM_*`` / ``SWARM_LLM_*`` / ``JUDGE_LLM_*``) and falls
+        back **per field** to the global ``LLM_*`` env vars. Missing or
+        empty-string role values are treated as unset, so a blank field
+        cleanly inherits the global value.
+
+        ``os.environ`` is read at call time (not the class attributes) so
+        runtime env mutations and ``monkeypatch.setenv`` take effect
+        without an importlib reload.
+
+        Args:
+            role: One of ``"builder"``, ``"swarm"``, ``"judge"``.
+
+        Returns:
+            ``(api_key, base_url, model)``. ``api_key`` may be ``None``
+            when neither the role env nor ``LLM_API_KEY`` is set.
+
+        Raises:
+            ValueError: If ``role`` is not one of the three known roles.
+
+        Example:
+            >>> Config.llm_for("builder")
+            ('sk-...', 'https://api.openai.com/v1', 'gpt-4o-mini')
+        """
+        prefixes = {"builder": "BUILDER", "swarm": "SWARM", "judge": "JUDGE"}
+        if role not in prefixes:
+            raise ValueError(f"unknown role: {role!r}")
+
+        prefix = prefixes[role]
+        api_key = os.environ.get(f"{prefix}_LLM_API_KEY", "") or os.environ.get(
+            "LLM_API_KEY", None
+        )
+        base_url = os.environ.get(f"{prefix}_LLM_BASE_URL", "") or os.environ.get(
+            "LLM_BASE_URL", DEFAULT_LLM_BASE_URL
+        )
+        model = os.environ.get(f"{prefix}_LLM_MODEL_NAME", "") or os.environ.get(
+            "LLM_MODEL_NAME", DEFAULT_LLM_MODEL_NAME
+        )
+        return (api_key, base_url, model)
 
