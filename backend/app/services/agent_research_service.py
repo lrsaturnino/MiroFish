@@ -1,22 +1,36 @@
 """
 Agent web research orchestration.
 
-This module ships the per-agent search-budget helper and the
-dependency-injected ``AgentResearchService`` class. Two behavioural
-surfaces are implemented here:
+This module ships the per-agent search-budget helper, the
+dependency-injected ``AgentResearchService`` class, and the colocated
+``ResearchJsonlLogger`` helper. Three behavioural surfaces are
+implemented here:
 
 * ``budget`` — a pure-arithmetic staticmethod that returns the per-agent
   search-query budget (zero for silent observers, otherwise the clamped
   ``round(RESEARCH_BASE_K * influence_weight)``).
+* ``is_enabled`` — env-driven gate (``RESEARCH_ENABLED=true`` AND
+  ``TAVILY_API_KEY`` set, both case-insensitively / non-empty after
+  strip). Read once at the top of every ``run`` call so a mid-run env
+  flip cannot half-write the JSONL file.
 * ``run`` — the orchestration entry point that walks the profile list,
   runs query-generation + cache-first search + opinion synthesis for
   every active agent, and mutates ``profile.persona`` in place. Per-agent
   failures are captured in ``self._last_run_errors`` instead of bubbling
-  out, so one broken agent never aborts the whole run.
+  out, so one broken agent never aborts the whole run. Each active
+  agent's run also produces one JSONL record (success or error path)
+  written via ``ResearchJsonlLogger``.
 
-``is_enabled`` remains a stub raising ``NotImplementedError`` and will
-be filled by the sibling ``RESEARCH_ENABLED`` / ``TAVILY_API_KEY`` env
-gating task.
+``ResearchJsonlLogger`` is a small append-only JSONL writer colocated in
+this module. It writes one JSON object per line, UTF-8, to
+``<project_dir>/agent_research.jsonl``. Schema (eight success-path keys
+plus optional ``error`` discriminator on the failure path):
+``agent_id``, ``queries``, ``search_results_summary``,
+``synthesized_opinion``, ``latency_ms``, ``tokens``, ``cache_hits``,
+``ts``. ``tokens`` is currently a placeholder dict
+(``{"prompt": 0, "completion": 0}``) because ``LLMClient.chat`` /
+``chat_json`` do not surface ``response.usage``; surfacing real token
+counts is deferred and out of scope for this module.
 
 The four collaborator parameters on the constructor (``search_provider``,
 ``cache``, ``llm_client``, ``jsonl_logger``) all default to ``None`` and
@@ -28,8 +42,57 @@ constructor kwarg so per-instance overrides are possible without touching
 environment configuration.
 """
 
+import json
+import logging
 import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
+
+
+class ResearchJsonlLogger:
+    """Append-only JSONL writer for per-agent research records.
+
+    One JSON object per line, UTF-8, to
+    ``<project_dir>/agent_research.jsonl``. The directory is created on
+    demand (``mkdir(parents=True, exist_ok=True)``) so callers do not
+    have to pre-create it. Each ``write`` call opens the file in append
+    mode, writes one line, and closes the handle — there is no shared
+    file object, which keeps the writer crash-safe between calls.
+
+    The writer auto-fills ``ts`` with the current ISO-8601 UTC timestamp
+    when the caller did not supply it; an explicit caller-supplied
+    ``ts`` always wins. ``json.dumps`` is called with
+    ``ensure_ascii=False`` so non-ASCII content (e.g. Chinese text in
+    ``synthesized_opinion``) round-trips losslessly.
+    """
+
+    def __init__(self, project_dir):
+        """Store the project directory path; resolve the JSONL log path.
+
+        ``project_dir`` accepts ``str`` or ``pathlib.Path`` — both are
+        normalised to ``Path``. The directory is NOT created here;
+        creation is deferred to the first ``write`` call so constructing
+        a logger never has filesystem side-effects.
+        """
+        self.project_dir = Path(project_dir)
+        self.log_path = self.project_dir / "agent_research.jsonl"
+
+    def write(self, record: dict) -> None:
+        """Append one JSON record to the JSONL file.
+
+        Auto-fills ``ts`` with ``datetime.now(timezone.utc).isoformat()``
+        when absent (caller-supplied ``ts`` wins via ``setdefault``).
+        Ensures the project directory exists before opening the file.
+        """
+        record.setdefault("ts", datetime.now(timezone.utc).isoformat())
+        self.project_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 class AgentResearchService:
@@ -52,6 +115,11 @@ class AgentResearchService:
     ``self._last_run_errors`` and the loop continues. The error list is
     reset at the top of every ``run`` call so stale errors never leak
     across consecutive invocations.
+
+    The env-driven ``is_enabled`` gate is read exactly once at the top
+    of each ``run`` call. When disabled, ``run`` emits one ``WARNING``
+    log line via the module logger and returns the same ``profiles``
+    list reference unchanged — no per-agent work, no JSONL file.
     """
 
     def __init__(
@@ -70,7 +138,22 @@ class AgentResearchService:
         self._last_run_errors: list[dict] = []
 
     def is_enabled(self) -> bool:
-        raise NotImplementedError("filled by T-010")
+        """Return ``True`` iff research is enabled by the environment.
+
+        The gate requires BOTH halves: ``RESEARCH_ENABLED`` must be the
+        literal string ``"true"`` after ``.strip().lower()`` (so
+        ``"TRUE"``, ``"True"``, ``" true "`` all enable; ``"1"``,
+        ``"yes"``, ``"on"`` do NOT — strict policy for least surprise),
+        AND ``TAVILY_API_KEY`` must be non-empty after strip (whitespace
+        sentinels are rejected).
+
+        Env values are read at call time so ``monkeypatch.setenv`` works
+        deterministically and operators can flip the gate without
+        restarting the process.
+        """
+        enabled = os.environ.get("RESEARCH_ENABLED", "").strip().lower() == "true"
+        has_key = bool(os.environ.get("TAVILY_API_KEY", "").strip())
+        return enabled and has_key
 
     def run(self, project_id, profiles, activity_by_user_id, topic_seed):
         """Walk ``profiles`` and append a synthesized opinion to each active agent.
@@ -89,11 +172,50 @@ class AgentResearchService:
         The error list is reset at the top of every call so stale
         errors never leak across consecutive invocations.
 
+        Each active agent (success or error path) also produces one
+        JSONL record written via ``self.jsonl_logger`` — auto-built
+        lazily from ``Config.UPLOAD_FOLDER`` and ``project_id`` when the
+        caller did not inject one.
+
+        Env-driven gate: ``self.is_enabled()`` is read exactly once at
+        entry. When disabled, the function emits one ``WARNING`` log
+        line and returns ``profiles`` unchanged — no LLM, no provider,
+        no JSONL.
+
         Returns the same ``profiles`` list reference (identity, not a
         copy) so callers can chain.
         """
         # Per-call reset — previous-run errors must not leak into this run.
+        # MUST happen before the gate check so the disabled path leaves
+        # the error list empty (test #19 contract).
         self._last_run_errors = []
+
+        # Gate read once at entry. A mid-run env flip cannot half-write
+        # because the loop body never re-reads the gate.
+        if not self.is_enabled():
+            logger.warning(
+                "research disabled: RESEARCH_ENABLED=%r TAVILY_API_KEY set: %s",
+                os.environ.get("RESEARCH_ENABLED", ""),
+                bool(os.environ.get("TAVILY_API_KEY", "").strip()),
+            )
+            return profiles
+
+        # Resolve the JSONL logger AFTER the gate — keeps the disabled
+        # path zero-cost and avoids creating directories in production
+        # when research is off.
+        jsonl_logger = self.jsonl_logger
+        if jsonl_logger is None:
+            # Local import: keep module top free of the Flask import
+            # chain so ``from app.services.agent_research_service import
+            # AgentResearchService, ResearchJsonlLogger`` stays smoke-
+            # importable without pulling Config (and transitively Flask).
+            from app.config import Config
+
+            project_dir = os.path.join(
+                Config.UPLOAD_FOLDER, "projects", str(project_id)
+            )
+            jsonl_logger = ResearchJsonlLogger(project_dir)
+
         for profile in profiles:
             activity = activity_by_user_id.get(profile.user_id)
             if activity is None:
@@ -103,20 +225,51 @@ class AgentResearchService:
             if k == 0:
                 # Silent observer — persona stays untouched.
                 continue
+
+            # Per-agent locals are pre-initialised so the ``finally`` block
+            # always sees well-formed values when building the JSONL record
+            # — even when an exception fires before the corresponding
+            # success-path assignment runs. ``error_message`` doubles as the
+            # success/error discriminator at record-write time.
+            start = time.perf_counter()
+            cache_hits = 0
+            queries: list[str] = []
+            results: list[dict] = []
+            truncated = ""
+            error_message: Optional[str] = None
             try:
                 queries = self._generate_queries(profile, activity, topic_seed, k)
-                results = self._run_search_loop(queries)
+                results, cache_hits = self._run_search_loop(queries)
                 opinion = self._synthesize_opinion(
                     profile, activity, topic_seed, results
                 )
                 truncated = self._truncate_to_cap(opinion)
                 profile.persona = profile.persona + "\n" + truncated
             except Exception as exc:
-                # Capture and continue — never re-raise. T-010's JSONL
-                # logger reads this list after run() returns.
+                # Capture and continue — never re-raise. The JSONL record
+                # below carries the same eight success-path keys plus an
+                # additive ``error`` discriminator (D4 schema).
+                error_message = str(exc)
                 self._last_run_errors.append(
-                    {"agent_id": profile.user_id, "error": str(exc)}
+                    {"agent_id": profile.user_id, "error": error_message}
                 )
+            finally:
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                record: dict = {
+                    "agent_id": profile.user_id,
+                    "queries": queries,
+                    "search_results_summary": self._project_results(results),
+                    "synthesized_opinion": truncated,
+                    "latency_ms": latency_ms,
+                    # ``tokens`` is a placeholder: LLMClient.chat /
+                    # chat_json do not surface response.usage today.
+                    # Surfacing real token counts is deferred.
+                    "tokens": {"prompt": 0, "completion": 0},
+                    "cache_hits": cache_hits,
+                }
+                if error_message is not None:
+                    record["error"] = error_message
+                jsonl_logger.write(record)
         return profiles
 
     def _generate_queries(self, profile, activity, topic_seed, k) -> list[str]:
@@ -157,7 +310,7 @@ class AgentResearchService:
             raise ValueError("query-gen returned no queries")
         return queries
 
-    def _run_search_loop(self, queries: list[str]) -> list[dict]:
+    def _run_search_loop(self, queries: list[str]) -> tuple[list[dict], int]:
         """Aggregate cache-first search results across the query list.
 
         For every query: ``cache.get`` first; on miss, call
@@ -165,13 +318,14 @@ class AgentResearchService:
         ``cache.set``. The cache's normalisation is internal to
         ``QueryCache``; callers pass the unmodified query string.
 
-        Returns the flattened list of ``SearchResult`` dicts (each
-        carrying ``title``, ``url``, ``snippet`` per ``T-006``'s
-        TypedDict). Empty per-query results are collected verbatim — an
-        all-empty aggregation still flows downstream so synthesis runs
-        on an empty snippets section instead of being short-circuited.
+        Returns ``(aggregated_results, cache_hits)`` where
+        ``cache_hits`` is the count of queries served from the cache.
+        Empty per-query results are collected verbatim — an all-empty
+        aggregation still flows downstream so synthesis runs on an empty
+        snippets section instead of being short-circuited.
         """
         aggregated: list[dict] = []
+        cache_hits = 0
         for query in queries:
             cached = self.cache.get(query)
             if cached is None:
@@ -179,8 +333,9 @@ class AgentResearchService:
                 self.cache.set(query, results)
             else:
                 results = cached
+                cache_hits += 1
             aggregated.extend(results)
-        return aggregated
+        return aggregated, cache_hits
 
     def _synthesize_opinion(self, profile, activity, topic_seed, results) -> str:
         """Collapse the aggregated snippets into a 2–3 sentence opinion.
@@ -218,6 +373,21 @@ class AgentResearchService:
         tolerate hanging tokens.
         """
         return opinion[: self.max_persona_append_chars]
+
+    @staticmethod
+    def _project_results(results: list[dict]) -> list[dict]:
+        """Project full ``SearchResult`` dicts down to the JSONL summary shape.
+
+        The JSONL ``search_results_summary`` field carries only ``title``
+        and ``url`` per the D4 schema — the full ``snippet`` is fed to
+        ``_synthesize_opinion`` but deliberately NOT persisted to the
+        log to keep records compact and PII-free. Missing keys default
+        to empty strings so downstream consumers never see ``None``.
+        """
+        return [
+            {"title": r.get("title", ""), "url": r.get("url", "")}
+            for r in results
+        ]
 
     @staticmethod
     def budget(influence_weight: float, activity_level: float) -> int:

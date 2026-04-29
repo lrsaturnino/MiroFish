@@ -24,6 +24,8 @@ and ``TestIsEnabled`` will be added to this file by future tasks. The
 class-based shape keeps the multi-task test file consistent.
 """
 
+import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,6 +39,8 @@ from app.services.search.cache import QueryCache
 # surfaces every reference at once.
 ENV_BASE_K = "RESEARCH_BASE_K"
 ENV_MAX_Q = "MAX_RESEARCH_QUERIES_PER_AGENT"
+ENV_RESEARCH = "RESEARCH_ENABLED"
+ENV_TAVILY = "TAVILY_API_KEY"
 
 
 # Sample SearchResult-shaped dicts used across TestRun scenarios.
@@ -768,3 +772,590 @@ class TestRun:
         combined = " ".join(m["content"] for m in messages)
         assert "opposing" in combined
         assert "X" in combined
+
+
+class TestIsEnabled:
+    """Truth-table tests for ``AgentResearchService.is_enabled`` — env-driven gate.
+
+    The gate resolves to ``True`` only when ``RESEARCH_ENABLED`` is the
+    literal string ``"true"`` (case-insensitive after ``.strip().lower()``)
+    AND ``TAVILY_API_KEY`` is non-empty after strip. Every other input
+    combination must return ``False`` — including the common ``"1"`` /
+    ``"yes"`` / ``"on"`` truthy variants, which are explicitly rejected
+    so operators see a single least-surprise enable string.
+
+    The autouse ``_clean_llm_env`` fixture in ``conftest.py`` installs
+    ``RESEARCH_ENABLED=true`` and ``TAVILY_API_KEY=test-key`` by default.
+    Every test in this class therefore explicitly overrides one or both
+    vars (delenv or setenv) so the assertion never silently passes on
+    ambient state.
+    """
+
+    # ----------------------------------------------------------------------
+    # Scenario 1 — Both env vars unset
+    # The conftest defaults must be deleted so the gate sees a true
+    # absence and returns False.
+    # ----------------------------------------------------------------------
+    def test_both_unset_returns_false(self, monkeypatch):
+        monkeypatch.delenv(ENV_RESEARCH, raising=False)
+        monkeypatch.delenv(ENV_TAVILY, raising=False)
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is False
+
+    # ----------------------------------------------------------------------
+    # Scenario 2 — Enabled flag set, key absent
+    # Both halves of the AND must hold; missing key → False.
+    # ----------------------------------------------------------------------
+    def test_enabled_flag_only_returns_false(self, monkeypatch):
+        monkeypatch.setenv(ENV_RESEARCH, "true")
+        monkeypatch.delenv(ENV_TAVILY, raising=False)
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is False
+
+    # ----------------------------------------------------------------------
+    # Scenario 3 — Key present but flag is "false"
+    # Strict-true policy: any non-"true" flag (case-insensitive) is False
+    # even with a real-looking key.
+    # ----------------------------------------------------------------------
+    def test_key_only_with_false_flag_returns_false(self, monkeypatch):
+        monkeypatch.setenv(ENV_RESEARCH, "false")
+        monkeypatch.setenv(ENV_TAVILY, "k")
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is False
+
+    # ----------------------------------------------------------------------
+    # Scenario 4 — Both set canonically (the only True case)
+    # Lower-case "true" + non-empty key → True.
+    # ----------------------------------------------------------------------
+    def test_both_set_canonically_returns_true(self, monkeypatch):
+        monkeypatch.setenv(ENV_RESEARCH, "true")
+        monkeypatch.setenv(ENV_TAVILY, "k")
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is True
+
+    # ----------------------------------------------------------------------
+    # Scenario 5 — Case-insensitive "TRUE"
+    # Upper-case is normalized via ``.strip().lower()`` to "true" → True.
+    # ----------------------------------------------------------------------
+    def test_case_insensitive_uppercase_true_returns_true(self, monkeypatch):
+        monkeypatch.setenv(ENV_RESEARCH, "TRUE")
+        monkeypatch.setenv(ENV_TAVILY, "k")
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is True
+
+    # ----------------------------------------------------------------------
+    # Scenario 6 — Case-insensitive "False"
+    # Mixed-case "False" normalizes to "false" → not equal to "true" →
+    # gate returns False.
+    # ----------------------------------------------------------------------
+    def test_case_insensitive_mixed_false_returns_false(self, monkeypatch):
+        monkeypatch.setenv(ENV_RESEARCH, "False")
+        monkeypatch.setenv(ENV_TAVILY, "k")
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is False
+
+    # ----------------------------------------------------------------------
+    # Scenario 7 — "1" is NOT truthy (D1 strict policy lock)
+    # Reject the common shell-truthy "1" so operators get one canonical
+    # enable string. If the production code ever switches to permissive
+    # parsing, this assertion surfaces it.
+    # ----------------------------------------------------------------------
+    def test_numeric_one_is_not_truthy(self, monkeypatch):
+        monkeypatch.setenv(ENV_RESEARCH, "1")
+        monkeypatch.setenv(ENV_TAVILY, "k")
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is False
+
+    # ----------------------------------------------------------------------
+    # Scenario 8 — Empty-string flag → False
+    # ``"".strip().lower() == ""`` which is not equal to "true".
+    # ----------------------------------------------------------------------
+    def test_empty_string_flag_returns_false(self, monkeypatch):
+        monkeypatch.setenv(ENV_RESEARCH, "")
+        monkeypatch.setenv(ENV_TAVILY, "k")
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is False
+
+    # ----------------------------------------------------------------------
+    # Scenario 9 — Empty-string key → False
+    # ``bool("".strip()) is False``; whitespace-only keys are also
+    # rejected via the same ``.strip()`` chain.
+    # ----------------------------------------------------------------------
+    def test_empty_string_key_returns_false(self, monkeypatch):
+        monkeypatch.setenv(ENV_RESEARCH, "true")
+        monkeypatch.setenv(ENV_TAVILY, "")
+        svc = AgentResearchService(
+            search_provider=MagicMock(),
+            cache=MagicMock(),
+            llm_client=MagicMock(),
+        )
+
+        assert svc.is_enabled() is False
+
+
+class TestJsonlLogger:
+    """Record-fidelity tests for ``ResearchJsonlLogger`` — append-only JSONL writer.
+
+    The logger is a small helper colocated in ``agent_research_service``
+    (not a separate module) and writes one JSON object per line, UTF-8,
+    to ``<project_dir>/agent_research.jsonl``. Each ``write`` call:
+
+    * ensures ``project_dir`` exists (``mkdir(parents=True, exist_ok=True)``),
+    * opens the file in append mode with ``encoding="utf-8"``,
+    * writes ``json.dumps(record, ensure_ascii=False) + "\\n"``,
+    * auto-fills ``ts`` (ISO-8601 UTC) when the caller did not supply it.
+
+    All tests scope file I/O to ``tmp_path`` so the real
+    ``backend/uploads/projects/`` tree is never touched.
+    """
+
+    # ----------------------------------------------------------------------
+    # Scenario 10 — Round-trip a single full record
+    # The eight-field success-path record (D4 schema) round-trips
+    # losslessly: write → read → ``json.loads`` returns the input dict.
+    # ----------------------------------------------------------------------
+    def test_write_one_record_round_trip(self, tmp_path):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        logger = ResearchJsonlLogger(tmp_path / "p1")
+        record = {
+            "agent_id": 1,
+            "queries": ["q1", "q2"],
+            "search_results_summary": [{"title": "t", "url": "https://u"}],
+            "synthesized_opinion": "op",
+            "latency_ms": 42,
+            "tokens": {"prompt": 0, "completion": 0},
+            "cache_hits": 0,
+            "ts": "2026-01-01T00:00:00+00:00",
+        }
+        logger.write(record)
+
+        path = tmp_path / "p1" / "agent_research.jsonl"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        parsed = json.loads(lines[0])
+        assert parsed == record
+
+    # ----------------------------------------------------------------------
+    # Scenario 11 — Append three records, preserve order
+    # Three sequential ``write`` calls produce three lines; each parses
+    # back to its dict and the ``agent_id`` order is preserved.
+    # ----------------------------------------------------------------------
+    def test_write_multiple_records_order_preserved(self, tmp_path):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        logger = ResearchJsonlLogger(tmp_path / "p1")
+        for agent_id in (1, 2, 3):
+            logger.write(
+                {
+                    "agent_id": agent_id,
+                    "queries": [],
+                    "search_results_summary": [],
+                    "synthesized_opinion": "",
+                    "latency_ms": 0,
+                    "tokens": {"prompt": 0, "completion": 0},
+                    "cache_hits": 0,
+                    "ts": "2026-01-01T00:00:00+00:00",
+                }
+            )
+
+        path = tmp_path / "p1" / "agent_research.jsonl"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 3
+        ids = [json.loads(line)["agent_id"] for line in lines]
+        assert ids == [1, 2, 3]
+
+    # ----------------------------------------------------------------------
+    # Scenario 12 — UTF-8 round-trip with non-ASCII content
+    # ``json.dumps(..., ensure_ascii=False)`` keeps Chinese characters
+    # as code points, the file is opened with ``encoding="utf-8"``, and
+    # the raw bytes decode back to the original string.
+    # ----------------------------------------------------------------------
+    def test_utf8_non_ascii_round_trip(self, tmp_path):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        chinese = "气候变化"
+        logger = ResearchJsonlLogger(tmp_path / "p1")
+        logger.write(
+            {
+                "agent_id": 1,
+                "queries": [],
+                "search_results_summary": [],
+                "synthesized_opinion": chinese,
+                "latency_ms": 0,
+                "tokens": {"prompt": 0, "completion": 0},
+                "cache_hits": 0,
+                "ts": "2026-01-01T00:00:00+00:00",
+            }
+        )
+
+        path = tmp_path / "p1" / "agent_research.jsonl"
+        # Read bytes directly to verify UTF-8 encoding (no BOM, no escape).
+        raw = path.read_bytes().decode("utf-8")
+        parsed = json.loads(raw.strip())
+        assert parsed["synthesized_opinion"] == chinese
+
+    # ----------------------------------------------------------------------
+    # Scenario 13 — Auto-fill ``ts`` when caller omits it
+    # ``record.setdefault("ts", datetime.now(timezone.utc).isoformat())``
+    # — the parsed line must carry a ``ts`` key, and
+    # ``datetime.fromisoformat`` must parse it AND yield a timezone-aware
+    # datetime.
+    # ----------------------------------------------------------------------
+    def test_auto_fill_ts_when_absent(self, tmp_path):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        logger = ResearchJsonlLogger(tmp_path / "p1")
+        logger.write(
+            {
+                "agent_id": 1,
+                "queries": [],
+                "search_results_summary": [],
+                "synthesized_opinion": "",
+                "latency_ms": 0,
+                "tokens": {"prompt": 0, "completion": 0},
+                "cache_hits": 0,
+            }
+        )
+
+        path = tmp_path / "p1" / "agent_research.jsonl"
+        parsed = json.loads(path.read_text(encoding="utf-8").strip())
+        assert "ts" in parsed
+        from datetime import datetime as _dt
+        ts_dt = _dt.fromisoformat(parsed["ts"])
+        assert ts_dt.tzinfo is not None
+
+    # ----------------------------------------------------------------------
+    # Scenario 14 — All eight documented fields present (success path)
+    # The canonical D4 schema requires eight keys. Verifies the writer
+    # serializes every one — no silent dropping of empty values.
+    # ----------------------------------------------------------------------
+    def test_all_eight_documented_fields_present(self, tmp_path):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        logger = ResearchJsonlLogger(tmp_path / "p1")
+        record = {
+            "agent_id": 1,
+            "queries": ["q"],
+            "search_results_summary": [{"title": "t", "url": "u"}],
+            "synthesized_opinion": "op",
+            "latency_ms": 10,
+            "tokens": {"prompt": 0, "completion": 0},
+            "cache_hits": 0,
+            "ts": "2026-01-01T00:00:00+00:00",
+        }
+        logger.write(record)
+
+        path = tmp_path / "p1" / "agent_research.jsonl"
+        parsed = json.loads(path.read_text(encoding="utf-8").strip())
+        expected_keys = {
+            "agent_id",
+            "queries",
+            "search_results_summary",
+            "synthesized_opinion",
+            "latency_ms",
+            "tokens",
+            "cache_hits",
+            "ts",
+        }
+        assert expected_keys.issubset(set(parsed.keys()))
+
+    # ----------------------------------------------------------------------
+    # Scenario 15 — Error-row shape is additive, not replacement
+    # The error path adds an ``error`` field to the same eight-field
+    # success shape (with empty/zero sentinels) so downstream consumers
+    # see one record schema with an optional ``error`` discriminator.
+    # ----------------------------------------------------------------------
+    def test_error_row_shape_additive(self, tmp_path):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        logger = ResearchJsonlLogger(tmp_path / "p1")
+        record = {
+            "agent_id": 1,
+            "queries": [],
+            "search_results_summary": [],
+            "synthesized_opinion": "",
+            "latency_ms": 7,
+            "tokens": {"prompt": 0, "completion": 0},
+            "cache_hits": 0,
+            "ts": "2026-01-01T00:00:00+00:00",
+            "error": "boom",
+        }
+        logger.write(record)
+
+        path = tmp_path / "p1" / "agent_research.jsonl"
+        parsed = json.loads(path.read_text(encoding="utf-8").strip())
+        assert parsed["error"] == "boom"
+        # Success-path keys still present (empty values, not omitted).
+        for key in (
+            "agent_id",
+            "queries",
+            "search_results_summary",
+            "synthesized_opinion",
+            "latency_ms",
+            "tokens",
+            "cache_hits",
+            "ts",
+        ):
+            assert key in parsed
+
+    # ----------------------------------------------------------------------
+    # Scenario 16 — Output dir auto-created when missing
+    # The logger constructor takes a project dir path; ``write`` creates
+    # the directory tree on demand. Nested missing parents (``deep/p_new``)
+    # are created in one call.
+    # ----------------------------------------------------------------------
+    def test_output_dir_auto_created_when_missing(self, tmp_path):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        target = tmp_path / "deep" / "p_new"
+        assert not target.exists()
+        logger = ResearchJsonlLogger(target)
+        logger.write(
+            {
+                "agent_id": 1,
+                "queries": [],
+                "search_results_summary": [],
+                "synthesized_opinion": "",
+                "latency_ms": 0,
+                "tokens": {"prompt": 0, "completion": 0},
+                "cache_hits": 0,
+                "ts": "2026-01-01T00:00:00+00:00",
+            }
+        )
+
+        assert target.is_dir()
+        assert (target / "agent_research.jsonl").is_file()
+
+
+class TestRunSkipPath:
+    """Skip-semantics tests for ``AgentResearchService.run`` — disabled gate.
+
+    These tests must override the autouse ``_clean_llm_env`` defaults so
+    the gate evaluates to ``False`` at ``run`` entry. When disabled,
+    ``run`` must:
+
+    * never call the LLM or search provider,
+    * leave every persona unchanged,
+    * not create the JSONL file at the expected path,
+    * emit exactly one ``WARNING`` log line via the module logger,
+    * return the SAME ``profiles`` list reference,
+    * not raise.
+
+    The single-read-at-entry contract (D3) is locked by scenario 20:
+    flipping the env mid-run does NOT cause a partial JSONL write.
+    """
+
+    # ----------------------------------------------------------------------
+    # Scenario 17 — Disabled → no-op, profiles unchanged, no jsonl file
+    # The five-active-agent setup proves no LLM/provider calls happen
+    # AND no jsonl file is written when the gate is False.
+    # ----------------------------------------------------------------------
+    def test_disabled_no_op_profiles_unchanged_no_jsonl_file(
+        self, monkeypatch, tmp_path
+    ):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        monkeypatch.delenv(ENV_RESEARCH, raising=False)
+        monkeypatch.setenv(ENV_BASE_K, "3")
+
+        mock_llm = MagicMock()
+        mock_llm.chat_json.return_value = {"queries": ["q1", "q2", "q3"]}
+        mock_llm.chat.return_value = "Synthesis."
+        mock_provider = MagicMock()
+        mock_provider.search.return_value = [SAMPLE_RESULT]
+        cache = QueryCache()
+        jsonl_logger = ResearchJsonlLogger(tmp_path / "p1")
+
+        svc = AgentResearchService(
+            search_provider=mock_provider,
+            cache=cache,
+            llm_client=mock_llm,
+            jsonl_logger=jsonl_logger,
+        )
+        profiles = [
+            _make_profile(
+                user_id=i, persona=f"P{i}", interested_topics=["x"], bio="b"
+            )
+            for i in range(1, 6)
+        ]
+        activity_map = {
+            i: _make_activity(0.5, 1.0, "supportive") for i in range(1, 6)
+        }
+
+        svc.run("p1", profiles, activity_map, topic_seed="topic")
+
+        assert mock_llm.chat_json.call_count == 0
+        assert mock_llm.chat.call_count == 0
+        assert mock_provider.search.call_count == 0
+        for i, profile in enumerate(profiles, start=1):
+            assert profile.persona == f"P{i}"
+        assert not (tmp_path / "p1" / "agent_research.jsonl").exists()
+
+    # ----------------------------------------------------------------------
+    # Scenario 18 — Disabled → exactly one WARNING via the module logger
+    # Caplog captures records propagated by ``logging.getLogger(__name__)``.
+    # ``__name__`` resolves to ``app.services.agent_research_service``
+    # inside the module; the test asserts the record's logger name and
+    # level + message substring.
+    # ----------------------------------------------------------------------
+    def test_disabled_emits_exactly_one_warning(self, monkeypatch, caplog):
+        monkeypatch.delenv(ENV_RESEARCH, raising=False)
+        monkeypatch.setenv(ENV_BASE_K, "3")
+        caplog.set_level(logging.WARNING, logger="app.services.agent_research_service")
+
+        mock_llm = MagicMock()
+        mock_provider = MagicMock()
+        cache = QueryCache()
+
+        svc = AgentResearchService(
+            search_provider=mock_provider,
+            cache=cache,
+            llm_client=mock_llm,
+        )
+        profile = _make_profile(
+            user_id=1, persona="P", interested_topics=["x"], bio="b"
+        )
+        activity = _make_activity(0.5, 1.0, "supportive")
+
+        svc.run("p1", [profile], {1: activity}, topic_seed="topic")
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING"
+            and r.name == "app.services.agent_research_service"
+        ]
+        assert len(warnings) == 1
+        assert "research disabled" in warnings[0].getMessage().lower()
+
+    # ----------------------------------------------------------------------
+    # Scenario 19 — Disabled run does NOT raise; same-list-reference returned
+    # The skip path returns the input ``profiles`` list verbatim
+    # (identity, not a copy) so AC-4 from T-009 still holds. Also asserts
+    # ``chat_json`` was never called — without this discriminator the
+    # test would silently pass against the un-gated code, because the
+    # current ``run`` body would catch the ValueError raised by the
+    # MagicMock's ``chat_json`` and still return ``profiles``.
+    # ----------------------------------------------------------------------
+    def test_disabled_does_not_raise_returns_same_list(self, monkeypatch):
+        monkeypatch.delenv(ENV_RESEARCH, raising=False)
+
+        mock_llm = MagicMock()
+        mock_provider = MagicMock()
+        cache = QueryCache()
+
+        svc = AgentResearchService(
+            search_provider=mock_provider,
+            cache=cache,
+            llm_client=mock_llm,
+        )
+        profile = _make_profile(
+            user_id=1, persona="P", interested_topics=["x"], bio="b"
+        )
+        activity = _make_activity(0.5, 1.0, "supportive")
+        profiles = [profile]
+
+        # The call must not raise (no pytest.raises).
+        result = svc.run("p1", profiles, {1: activity}, topic_seed="topic")
+        assert result is profiles
+        # Discriminator: when the gate is disabled, no LLM work happens
+        # at all. Without this, the assertion above passes against
+        # un-gated code via the per-agent error-isolation path.
+        assert mock_llm.chat_json.call_count == 0
+        assert svc._last_run_errors == []
+
+    # ----------------------------------------------------------------------
+    # Scenario 20 — Mid-run env flip cannot half-write
+    # The gate is read exactly ONCE at ``run`` entry (D3). Flipping
+    # ``RESEARCH_ENABLED=false`` mid-loop (via a side_effect closure
+    # invoked on the first ``chat_json`` call) MUST NOT abort the loop:
+    # all three records still land in the jsonl file.
+    # ----------------------------------------------------------------------
+    def test_mid_run_env_flip_cannot_half_write(self, monkeypatch, tmp_path):
+        from app.services.agent_research_service import ResearchJsonlLogger
+
+        monkeypatch.setenv(ENV_RESEARCH, "true")
+        monkeypatch.setenv(ENV_TAVILY, "k")
+        monkeypatch.setenv(ENV_BASE_K, "1")
+
+        flipped = {"done": False}
+
+        def _flip_after_first_call(*args, **kwargs):
+            # On the first call, flip the env; the gate must already
+            # have been read at run() entry so this flip is a no-op for
+            # the in-flight loop.
+            if not flipped["done"]:
+                monkeypatch.setenv(ENV_RESEARCH, "false")
+                flipped["done"] = True
+            return {"queries": ["q"]}
+
+        mock_llm = MagicMock()
+        mock_llm.chat_json.side_effect = _flip_after_first_call
+        mock_llm.chat.return_value = "Synthesis."
+        mock_provider = MagicMock()
+        mock_provider.search.return_value = [SAMPLE_RESULT]
+        cache = QueryCache()
+        jsonl_logger = ResearchJsonlLogger(tmp_path / "p1")
+
+        svc = AgentResearchService(
+            search_provider=mock_provider,
+            cache=cache,
+            llm_client=mock_llm,
+            jsonl_logger=jsonl_logger,
+        )
+        profiles = [
+            _make_profile(
+                user_id=i, persona=f"P{i}", interested_topics=["x"], bio="b"
+            )
+            for i in range(1, 4)
+        ]
+        activity_map = {
+            i: _make_activity(0.5, 1.0, "supportive") for i in range(1, 4)
+        }
+
+        svc.run("p1", profiles, activity_map, topic_seed="topic")
+
+        path = tmp_path / "p1" / "agent_research.jsonl"
+        assert path.exists()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 3

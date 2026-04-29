@@ -13,6 +13,14 @@ explicitly inside the test body — making each test self-describing.
 
 The fixture is intentionally scoped to ``backend/tests/`` (not ``backend/``)
 so that ``backend/scripts/test_profile_format.py`` is not touched.
+
+In addition to clearing LLM env vars, the fixture installs sensible defaults
+for the research-gating env vars (``RESEARCH_ENABLED=true``,
+``TAVILY_API_KEY=test-key``). This keeps ``AgentResearchService.run``
+callers from hitting the disabled-path no-op every test once the gate is
+wired into ``run()``. Tests that need to exercise the disabled path must
+explicitly ``delenv`` (or ``setenv`` to a non-truthy value) inside the
+test body.
 """
 
 import pytest
@@ -37,8 +45,16 @@ _LLM_ENV_VARS = (
 @pytest.fixture(autouse=True)
 def _clean_llm_env(monkeypatch):
     """Remove every LLM-related env var so each test starts from a known
-    clean slate. ``raising=False`` keeps this idempotent on machines where
-    the variable was never present."""
+    clean slate, and install research-gate defaults so ``run()`` does not
+    short-circuit unless a test asks for it. ``raising=False`` keeps the
+    delenv loop idempotent on machines where the variable was never
+    present."""
     for name in _LLM_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    # Default the research gate to "enabled" so existing TestRun tests
+    # continue to exercise the full per-agent loop after run() begins
+    # gating on is_enabled(). Tests that target the disabled path must
+    # explicitly delenv or override these.
+    monkeypatch.setenv("RESEARCH_ENABLED", "true")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
     yield
