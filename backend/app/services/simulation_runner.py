@@ -432,7 +432,23 @@ class SimulationRunner:
             env = os.environ.copy()
             env['PYTHONUTF8'] = '1'  # Python 3.7+ 支持，让所有 open() 默认使用 UTF-8
             env['PYTHONIOENCODING'] = 'utf-8'  # 确保 stdout/stderr 使用 UTF-8
-            
+
+            # 注入 SWARM 角色 LLM 凭据到子进程环境（OASIS 群体模拟的批量 LLM）
+            # The OASIS subprocess reads ``LLM_*`` and re-publishes to ``OPENAI_*``;
+            # writing BOTH name pairs lets the subprocess see SWARM credentials
+            # regardless of which name it consults. Each conditional write is
+            # gated on the SOURCE env var being present in ``os.environ`` so
+            # the resolver's non-None defaults never leak into the subprocess.
+            swarm_api_key, swarm_base_url, swarm_model = Config.llm_for("swarm")
+            if (os.environ.get("SWARM_LLM_API_KEY") or os.environ.get("LLM_API_KEY")) and swarm_api_key:
+                env["LLM_API_KEY"] = swarm_api_key
+                env["OPENAI_API_KEY"] = swarm_api_key
+            if (os.environ.get("SWARM_LLM_BASE_URL") or os.environ.get("LLM_BASE_URL")) and swarm_base_url:
+                env["LLM_BASE_URL"] = swarm_base_url
+                env["OPENAI_API_BASE_URL"] = swarm_base_url
+            if (os.environ.get("SWARM_LLM_MODEL_NAME") or os.environ.get("LLM_MODEL_NAME")) and swarm_model:
+                env["LLM_MODEL_NAME"] = swarm_model
+
             # 设置工作目录为模拟目录（数据库等文件会生成在此）
             # 使用 start_new_session=True 创建新的进程组，确保可以通过 os.killpg 终止所有子进程
             process = subprocess.Popen(
