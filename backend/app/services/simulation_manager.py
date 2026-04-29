@@ -4,6 +4,7 @@ OASIS模拟管理器
 使用预设脚本 + LLM智能生成配置参数
 """
 
+import logging
 import os
 import json
 import shutil
@@ -14,12 +15,26 @@ from enum import Enum
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.llm_client import LLMClient
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
+from .agent_research_service import AgentResearchService, ResearchJsonlLogger
+from .search.tavily import TavilyProvider
+from .search.cache import QueryCache
 from ..utils.locale import t
 
 logger = get_logger('mirofish.simulation')
+
+# Standard-library logger used only for the research-step defensive
+# wrap below. The project-wide ``mirofish.simulation`` logger has
+# ``propagate=False`` (by design — see ``app/utils/logger.py``), so its
+# records do not bubble to the root logger and are therefore invisible
+# to test fixtures (e.g. pytest ``caplog``) that attach at the root.
+# This sub-logger uses module name and the standard logging hierarchy
+# so callers / observers can configure / capture it via the standard
+# ``logging`` API without touching the project logger.
+_research_logger = logging.getLogger(__name__)
 
 
 class SimulationStatus(str, Enum):
@@ -331,6 +346,103 @@ class SimulationManager:
         self._save_simulation_state(state)
         return state
     
+    def _run_research_step(
+        self,
+        state: SimulationState,
+        profiles: List[OasisAgentProfile],
+        sim_params: SimulationParameters,
+        simulation_requirement: str,
+    ) -> List[OasisAgentProfile]:
+        """Pipeline Step 2.5 — one-shot agent web research (planning §5.8 / §3.3).
+
+        Constructs ``AgentResearchService`` once per ``prepare_simulation``
+        invocation with all four collaborators wired explicitly
+        (``TavilyProvider``, ``QueryCache``, ``LLMClient(role="builder")``,
+        ``ResearchJsonlLogger``). Builds ``activity_by_user_id`` from
+        ``sim_params.agent_configs`` (``user_id`` and ``agent_id`` are both
+        sequential ints walking the same filtered-entities list — verified
+        in ``oasis_profile_generator.py`` and ``simulation_config_generator.py``)
+        and forwards ``simulation_requirement`` as the ``topic_seed`` arg
+        (planning §9.3 — the operator-supplied "news subject" the agents
+        are searching about).
+
+        The service self-gates internally on ``RESEARCH_ENABLED`` +
+        ``TAVILY_API_KEY``: when disabled it emits one ``WARNING`` line
+        and returns the profile list unchanged at zero cost. This is why
+        no external ``if service.is_enabled():`` guard is needed — the
+        host always calls ``run()`` and trusts the contract.
+
+        The full service-construct-and-run block is wrapped in a
+        defensive ``try/except Exception`` so a catastrophic failure
+        (``LLMClient`` constructor without env vars, provider/cache
+        construction error, I/O error on the JSONL logger's first
+        ``write`` — the project dir is created lazily inside ``write``,
+        not in the logger's constructor) NEVER aborts the pipeline
+        (planning §3.4 NFR-1). Per-agent failures are already isolated
+        inside the service loop. On catch we surface the traceback via
+        ``logger.exception`` and return the original profile list
+        reference so ``save_profiles`` below sees the un-mutated data.
+
+        Args:
+            state: The current ``SimulationState`` (read for
+                ``state.project_id``).
+            profiles: The freshly-generated profile list from Phase 2.
+                Mutated in place by the service's success path; returned
+                unchanged on disabled or catastrophic-failure paths.
+            sim_params: The Phase-3 ``SimulationParameters`` carrying
+                ``agent_configs: List[AgentActivityConfig]``.
+            simulation_requirement: Forwarded as ``topic_seed`` to
+                ``AgentResearchService.run``.
+
+        Returns:
+            The (possibly mutated) profile list. Same list reference as
+            the input on disabled and catastrophic-failure paths.
+        """
+        original_profiles = profiles
+        try:
+            project_dir = os.path.join(
+                Config.UPLOAD_FOLDER, "projects", str(state.project_id)
+            )
+            service = AgentResearchService(
+                search_provider=TavilyProvider(),
+                cache=QueryCache(),
+                llm_client=LLMClient(role="builder"),
+                jsonl_logger=ResearchJsonlLogger(project_dir),
+            )
+            activity_by_user_id = {
+                ac.agent_id: ac for ac in sim_params.agent_configs
+            }
+            if len(activity_by_user_id) != len(profiles):
+                # Defensive sanity check: ``user_id`` and ``agent_id``
+                # are both sequential ``int`` walking the same
+                # filtered entities list. A length mismatch signals an
+                # upstream filter divergence — log loudly but do not
+                # raise; the service skips per-agent when ``activity is
+                # None``.
+                _research_logger.warning(
+                    "activity_by_user_id length (%d) does not match "
+                    "profiles length (%d); some agents will be skipped",
+                    len(activity_by_user_id),
+                    len(profiles),
+                )
+            return service.run(
+                state.project_id,
+                profiles,
+                activity_by_user_id,
+                simulation_requirement,
+            )
+        except Exception:
+            # Use the standard-library sub-logger (propagates to root)
+            # so this catastrophic-failure record is visible to standard
+            # log handlers AND test capture fixtures (e.g. pytest
+            # ``caplog``). The project ``mirofish.simulation`` logger
+            # has ``propagate=False`` by design — see
+            # ``app/utils/logger.py``.
+            _research_logger.exception(
+                "research step failed; continuing with un-researched profiles"
+            )
+            return original_profiles
+
     def prepare_simulation(
         self,
         simulation_id: str,
@@ -451,41 +563,12 @@ class SimulationManager:
             )
             
             state.profiles_count = len(profiles)
-            
-            # 保存Profile文件（注意：Twitter使用CSV格式，Reddit使用JSON格式）
-            # Reddit 已经在生成过程中实时保存了，这里再保存一次确保完整性
-            if progress_callback:
-                progress_callback(
-                    "generating_profiles", 95,
-                    t('progress.savingProfiles'),
-                    current=total_entities,
-                    total=total_entities
-                )
-            
-            if state.enable_reddit:
-                generator.save_profiles(
-                    profiles=profiles,
-                    file_path=os.path.join(sim_dir, "reddit_profiles.json"),
-                    platform="reddit"
-                )
-            
-            if state.enable_twitter:
-                # Twitter使用CSV格式！这是OASIS的要求
-                generator.save_profiles(
-                    profiles=profiles,
-                    file_path=os.path.join(sim_dir, "twitter_profiles.csv"),
-                    platform="twitter"
-                )
-            
-            if progress_callback:
-                progress_callback(
-                    "generating_profiles", 100,
-                    t('progress.profilesComplete', count=len(profiles)),
-                    current=len(profiles),
-                    total=len(profiles)
-                )
-            
+
             # ========== 阶段3: LLM智能生成模拟配置 ==========
+            # Moved above save_profiles so that ``sim_params.agent_configs``
+            # (the per-agent activity records) is available for Step 2.5
+            # below — research needs ``activity_by_user_id`` to compute
+            # per-agent search budgets and read each agent's ``stance``.
             if progress_callback:
                 progress_callback(
                     "generating_config", 0,
@@ -493,9 +576,9 @@ class SimulationManager:
                     current=0,
                     total=3
                 )
-            
+
             config_generator = SimulationConfigGenerator()
-            
+
             if progress_callback:
                 progress_callback(
                     "generating_config", 30,
@@ -503,7 +586,7 @@ class SimulationManager:
                     current=1,
                     total=3
                 )
-            
+
             sim_params = config_generator.generate_config(
                 simulation_id=simulation_id,
                 project_id=state.project_id,
@@ -514,7 +597,7 @@ class SimulationManager:
                 enable_twitter=state.enable_twitter,
                 enable_reddit=state.enable_reddit
             )
-            
+
             if progress_callback:
                 progress_callback(
                     "generating_config", 70,
@@ -522,15 +605,15 @@ class SimulationManager:
                     current=2,
                     total=3
                 )
-            
+
             # 保存配置文件
             config_path = os.path.join(sim_dir, "simulation_config.json")
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.write(sim_params.to_json())
-            
+
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
-            
+
             if progress_callback:
                 progress_callback(
                     "generating_config", 100,
@@ -538,10 +621,56 @@ class SimulationManager:
                     current=3,
                     total=3
                 )
-            
+
+            # Pipeline Step 2.5 (per planning §5.8 / §3.3): one-shot
+            # agent web research, after personas bake AND after activity
+            # configs exist, before profiles are serialized to CSV/JSON.
+            # topic_seed = simulation_requirement (planning §9.3 — the
+            # operator-supplied "news subject" the agents are searching
+            # about; same string forwarded into the config generator
+            # above and the empirically-correct field per AC-4).
+            # See ``_run_research_step`` for the contract details and
+            # the catastrophic-failure isolation rationale.
+            profiles = self._run_research_step(
+                state, profiles, sim_params, simulation_requirement
+            )
+
+            # 保存Profile文件（注意：Twitter使用CSV格式，Reddit使用JSON格式）
+            # Reddit 已经在生成过程中实时保存了，这里再保存一次确保完整性
+            if progress_callback:
+                progress_callback(
+                    "generating_profiles", 95,
+                    t('progress.savingProfiles'),
+                    current=total_entities,
+                    total=total_entities
+                )
+
+            if state.enable_reddit:
+                generator.save_profiles(
+                    profiles=profiles,
+                    file_path=os.path.join(sim_dir, "reddit_profiles.json"),
+                    platform="reddit"
+                )
+
+            if state.enable_twitter:
+                # Twitter使用CSV格式！这是OASIS的要求
+                generator.save_profiles(
+                    profiles=profiles,
+                    file_path=os.path.join(sim_dir, "twitter_profiles.csv"),
+                    platform="twitter"
+                )
+
+            if progress_callback:
+                progress_callback(
+                    "generating_profiles", 100,
+                    t('progress.profilesComplete', count=len(profiles)),
+                    current=len(profiles),
+                    total=len(profiles)
+                )
+
             # 注意：运行脚本保留在 backend/scripts/ 目录，不再复制到模拟目录
             # 启动模拟时，simulation_runner 会从 scripts/ 目录运行脚本
-            
+
             # 更新状态
             state.status = SimulationStatus.READY
             self._save_simulation_state(state)
