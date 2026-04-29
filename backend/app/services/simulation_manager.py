@@ -42,7 +42,22 @@ class PlatformType(str, Enum):
 
 @dataclass
 class SimulationState:
-    """模拟状态"""
+    """模拟状态 (Simulation state — operator-visible persistence record).
+
+    Persistence schema for one simulation run. Serialized via the hand-written
+    ``to_dict`` below and read back via ``SimulationManager._load_simulation_state``.
+
+    The trailing ``builder_model_name``/``swarm_model_name``/``judge_model_name``
+    fields are persisted **for UI round-trip only (v1 scope)**. They do NOT,
+    on their own, change the runtime LLM resolution path. The actual per-role
+    LLM split takes effect via the ``BUILDER_LLM_*`` / ``SWARM_LLM_*`` /
+    ``JUDGE_LLM_*`` environment variables resolved by ``Config.llm_for(role)``
+    at process start (see ``app/config.py``). These three fields exist so the
+    Step1 UI can read and write the operator's preferred per-role model
+    identifiers; bridging UI value into the runtime resolver is out of scope
+    in this TD and may be picked up by a future task. Empty string ``""`` is
+    the canonical "inherit from ``LLM_*``" sentinel — never ``None``.
+    """
     simulation_id: str
     project_id: str
     graph_id: str
@@ -74,7 +89,20 @@ class SimulationState:
     
     # 错误信息
     error: Optional[str] = None
-    
+
+    # UI-persisted operator hint for the BUILDER role; the actual override is
+    # delivered to the runtime via the BUILDER_LLM_* env vars resolved by
+    # Config.llm_for("builder"). Empty string ⇒ inherit LLM_*.
+    builder_model_name: str = ""
+    # UI-persisted operator hint for the SWARM role; runtime override flows
+    # through SWARM_LLM_* env vars resolved by Config.llm_for("swarm").
+    # Empty string ⇒ inherit LLM_*.
+    swarm_model_name: str = ""
+    # UI-persisted operator hint for the JUDGE role; runtime override flows
+    # through JUDGE_LLM_* env vars resolved by Config.llm_for("judge").
+    # Empty string ⇒ inherit LLM_*.
+    judge_model_name: str = ""
+
     def to_dict(self) -> Dict[str, Any]:
         """完整状态字典（内部使用）"""
         return {
@@ -95,6 +123,9 @@ class SimulationState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "error": self.error,
+            "builder_model_name": self.builder_model_name,
+            "swarm_model_name": self.swarm_model_name,
+            "judge_model_name": self.judge_model_name,
         }
     
     def to_simple_dict(self) -> Dict[str, Any]:
@@ -186,6 +217,14 @@ class SimulationManager:
             created_at=data.get("created_at", datetime.now().isoformat()),
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             error=data.get("error"),
+            # ``or ""`` coerces both missing keys (returns ``None``) AND
+            # explicit JSON ``null`` to the canonical empty-string sentinel.
+            # Limited to these three string-only fields; do NOT propagate
+            # this pattern to fields where ``0`` / ``False`` / ``""`` carry
+            # distinct meaning.
+            builder_model_name=data.get("builder_model_name") or "",
+            swarm_model_name=data.get("swarm_model_name") or "",
+            judge_model_name=data.get("judge_model_name") or "",
         )
         
         self._simulations[simulation_id] = state
@@ -197,22 +236,32 @@ class SimulationManager:
         graph_id: str,
         enable_twitter: bool = True,
         enable_reddit: bool = True,
+        builder_model_name: str = "",
+        swarm_model_name: str = "",
+        judge_model_name: str = "",
     ) -> SimulationState:
         """
         创建新的模拟
-        
+
         Args:
             project_id: 项目ID
             graph_id: Zep图谱ID
             enable_twitter: 是否启用Twitter模拟
             enable_reddit: 是否启用Reddit模拟
-            
+            builder_model_name: UI-persisted operator hint for the BUILDER role.
+                Empty string ⇒ inherit from the global ``LLM_*`` env vars via
+                ``Config.llm_for("builder")``.
+            swarm_model_name: UI-persisted operator hint for the SWARM role.
+                Empty string ⇒ inherit from ``Config.llm_for("swarm")``.
+            judge_model_name: UI-persisted operator hint for the JUDGE role.
+                Empty string ⇒ inherit from ``Config.llm_for("judge")``.
+
         Returns:
             SimulationState
         """
         import uuid
         simulation_id = f"sim_{uuid.uuid4().hex[:12]}"
-        
+
         state = SimulationState(
             simulation_id=simulation_id,
             project_id=project_id,
@@ -220,11 +269,66 @@ class SimulationManager:
             enable_twitter=enable_twitter,
             enable_reddit=enable_reddit,
             status=SimulationStatus.CREATED,
+            builder_model_name=builder_model_name,
+            swarm_model_name=swarm_model_name,
+            judge_model_name=judge_model_name,
         )
-        
+
         self._save_simulation_state(state)
         logger.info(f"创建模拟: {simulation_id}, project={project_id}, graph={graph_id}")
-        
+
+        return state
+
+    def update_simulation(
+        self,
+        simulation_id: str,
+        *,
+        builder_model_name: Optional[str] = None,
+        swarm_model_name: Optional[str] = None,
+        judge_model_name: Optional[str] = None,
+    ) -> SimulationState:
+        """Partial update of the three operator-visible model-name fields.
+
+        Sentinel discipline:
+            * ``None``  → "do not touch this field"
+            * ``""``    → "set this field to inherit from ``LLM_*``"
+
+        This is the only place where ``None`` and ``""`` carry different
+        meanings. Callers that want to clear a field must pass ``""``
+        explicitly; omitting the kwarg leaves the persisted value untouched.
+
+        Example:
+            ``manager.update_simulation("sim_abc", swarm_model_name="haiku")``
+            mutates only ``swarm_model_name``; ``builder_model_name`` and
+            ``judge_model_name`` remain at their persisted values.
+
+        Args:
+            simulation_id: Existing simulation to mutate.
+            builder_model_name: New BUILDER role hint, or ``None`` to leave
+                the persisted value unchanged.
+            swarm_model_name: New SWARM role hint, or ``None`` to leave
+                the persisted value unchanged.
+            judge_model_name: New JUDGE role hint, or ``None`` to leave
+                the persisted value unchanged.
+
+        Returns:
+            The updated ``SimulationState``.
+
+        Raises:
+            ValueError: If ``simulation_id`` does not exist.
+        """
+        state = self._load_simulation_state(simulation_id)
+        if not state:
+            raise ValueError(f"模拟不存在: {simulation_id}")
+
+        if builder_model_name is not None:
+            state.builder_model_name = builder_model_name
+        if swarm_model_name is not None:
+            state.swarm_model_name = swarm_model_name
+        if judge_model_name is not None:
+            state.judge_model_name = judge_model_name
+
+        self._save_simulation_state(state)
         return state
     
     def prepare_simulation(

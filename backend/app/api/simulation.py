@@ -166,17 +166,26 @@ def get_entities_by_type(graph_id: str, entity_type: str):
 def create_simulation():
     """
     创建新的模拟
-    
+
     注意：max_rounds等参数由LLM智能生成，无需手动设置
-    
+
     请求（JSON）：
         {
-            "project_id": "proj_xxxx",      // 必填
-            "graph_id": "mirofish_xxxx",    // 可选，如不提供则从project获取
-            "enable_twitter": true,          // 可选，默认true
-            "enable_reddit": true            // 可选，默认true
+            "project_id": "proj_xxxx",       // 必填
+            "graph_id": "mirofish_xxxx",     // 可选，如不提供则从project获取
+            "enable_twitter": true,           // 可选，默认true
+            "enable_reddit": true,            // 可选，默认true
+            "builder_model_name": "gpt-4o",   // 可选，UI 持久化字段，默认 ""
+            "swarm_model_name": "qwen-plus",  // 可选，UI 持久化字段，默认 ""
+            "judge_model_name": ""            // 可选，UI 持久化字段，默认 ""
         }
-    
+
+    模型字段语义（v1 仅持久化，不参与运行时解析）：
+        三个 ``*_model_name`` 字段为操作员可见的 UI 持久化字段，缺省或显式为 ""
+        表示该角色继承全局 ``LLM_*`` 配置（由 ``Config.llm_for(role)`` 在进程
+        启动时从 ``BUILDER_LLM_*`` / ``SWARM_LLM_*`` / ``JUDGE_LLM_*`` 环境
+        变量解析）。本端点仅负责持久化，不会修改运行时 LLM 选择路径。
+
     返回：
         {
             "success": true,
@@ -187,6 +196,9 @@ def create_simulation():
                 "status": "created",
                 "enable_twitter": true,
                 "enable_reddit": true,
+                "builder_model_name": "gpt-4o",
+                "swarm_model_name": "qwen-plus",
+                "judge_model_name": "",
                 "created_at": "2025-12-01T10:00:00"
             }
         }
@@ -221,6 +233,9 @@ def create_simulation():
             graph_id=graph_id,
             enable_twitter=data.get('enable_twitter', True),
             enable_reddit=data.get('enable_reddit', True),
+            builder_model_name=data.get('builder_model_name', ''),
+            swarm_model_name=data.get('swarm_model_name', ''),
+            judge_model_name=data.get('judge_model_name', ''),
         )
         
         return jsonify({
@@ -758,26 +773,82 @@ def get_simulation(simulation_id: str):
     try:
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
-        
+
         if not state:
             return jsonify({
                 "success": False,
                 "error": t('api.simulationNotFound', id=simulation_id)
             }), 404
-        
+
         result = state.to_dict()
-        
+
         # 如果模拟已准备好，附加运行说明
         if state.status == SimulationStatus.READY:
             result["run_instructions"] = manager.get_run_instructions(simulation_id)
-        
+
         return jsonify({
             "success": True,
             "data": result
         })
-        
+
     except Exception as e:
         logger.error(f"获取模拟状态失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+# Partial-update endpoint, paired with the GET handler above (Flask routes by
+# the (method, path) tuple, so PATCH on the same path is a distinct route).
+# Scope: only the three operator-visible model-name fields. Any key absent
+# from the payload is left untouched (sentinel ``None`` at the manager).
+_UPDATABLE_MODEL_FIELDS = ("builder_model_name", "swarm_model_name", "judge_model_name")
+
+
+@simulation_bp.route('/<simulation_id>', methods=['PATCH'])
+def update_simulation(simulation_id: str):
+    """
+    部分更新模拟的 UI-persisted 模型字段
+
+    请求（JSON）：
+        任意一个或多个：
+        {
+            "builder_model_name": "gpt-4o",
+            "swarm_model_name": "qwen-plus",
+            "judge_model_name": ""
+        }
+
+    语义：
+        * 字段缺省 ⇒ 不修改持久化值
+        * 字段为 ""  ⇒ 该角色继承全局 LLM_* 配置
+
+    返回：
+        {"success": true, "data": <state.to_dict()>}
+    """
+    try:
+        data = request.get_json() or {}
+
+        # Filter on key presence, not value truthiness — explicit ""
+        # is meaningful (= "set to inherit") and must reach the manager.
+        kwargs = {key: data[key] for key in _UPDATABLE_MODEL_FIELDS if key in data}
+
+        manager = SimulationManager()
+        state = manager.update_simulation(simulation_id, **kwargs)
+
+        return jsonify({
+            "success": True,
+            "data": state.to_dict()
+        })
+
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 404
+    except Exception as e:
+        logger.error(f"更新模拟失败: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),
