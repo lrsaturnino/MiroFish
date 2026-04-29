@@ -95,7 +95,13 @@
     "creating": "创建中...",
     "enterEnvSetup": "进入环境搭建",
     "createSimulationFailed": "创建模拟失败: {error}",
-    "createSimulationException": "创建模拟异常: {error}"
+    "createSimulationException": "创建模拟异常: {error}",
+    "roleModelsHeading": "可选：按角色分配的大模型",
+    "roleModelsDesc": "为不同流水线角色覆盖默认 LLM_MODEL_NAME，留空则继承全局配置。",
+    "builderModelLabel": "BUILDER",
+    "swarmModelLabel": "SWARM",
+    "judgeModelLabel": "JUDGE",
+    "roleModelsPlaceholder": "继承 LLM_MODEL_NAME"
   },
   "step2": {
     "simInstanceInit": "模拟实例初始化",

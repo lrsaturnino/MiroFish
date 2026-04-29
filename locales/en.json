@@ -95,7 +95,13 @@
     "creating": "Creating...",
     "enterEnvSetup": "Enter Environment Setup",
     "createSimulationFailed": "Failed to create simulation: {error}",
-    "createSimulationException": "Simulation creation error: {error}"
+    "createSimulationException": "Simulation creation error: {error}",
+    "roleModelsHeading": "Optional: Role-scoped LLM models",
+    "roleModelsDesc": "Override the default LLM_MODEL_NAME per pipeline role. Leave blank to inherit.",
+    "builderModelLabel": "BUILDER",
+    "swarmModelLabel": "SWARM",
+    "judgeModelLabel": "JUDGE",
+    "roleModelsPlaceholder": "inherit from LLM_MODEL_NAME"
   },
   "step2": {
     "simInstanceInit": "Simulation Instance Initialization",
