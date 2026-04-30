@@ -1231,6 +1231,11 @@ class TestRunSkipPath:
         for i, profile in enumerate(profiles, start=1):
             assert profile.persona == f"P{i}"
         assert not (tmp_path / "p1" / "agent_research.jsonl").exists()
+        # Companion meta file must NOT be written when the env-driven
+        # gate is closed — preserves the "off mode leaves no artifacts"
+        # contract that the progress endpoint relies on to decide
+        # research-not-yet-started vs research-disabled.
+        assert not (tmp_path / "p1" / "agent_research.meta.json").exists()
 
     # ----------------------------------------------------------------------
     # Scenario 18 — Disabled → exactly one WARNING via the module logger

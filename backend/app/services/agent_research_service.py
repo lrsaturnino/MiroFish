@@ -177,10 +177,20 @@ class AgentResearchService:
         lazily from ``Config.UPLOAD_FOLDER`` and ``project_id`` when the
         caller did not inject one.
 
+        Side-effect — companion ``agent_research.meta.json`` file is
+        written once at entry (after the gate, before the per-agent
+        loop) at ``<project_dir>/agent_research.meta.json``. Schema:
+        ``{"total_active_agents": N, "started_at": iso_ts}`` where ``N``
+        is the count of profiles whose activity record exists and whose
+        ``activity_level >= 0.1`` (the silent-observer skip threshold).
+        The file gives the progress endpoint a denominator without
+        re-reading project state. The file is NOT written on the
+        disabled path so an off-mode run leaves no artifacts.
+
         Env-driven gate: ``self.is_enabled()`` is read exactly once at
         entry. When disabled, the function emits one ``WARNING`` log
         line and returns ``profiles`` unchanged — no LLM, no provider,
-        no JSONL.
+        no JSONL, no meta file.
 
         Returns the same ``profiles`` list reference (identity, not a
         copy) so callers can chain.
@@ -215,6 +225,33 @@ class AgentResearchService:
                 Config.UPLOAD_FOLDER, "projects", str(project_id)
             )
             jsonl_logger = ResearchJsonlLogger(project_dir)
+
+        # Companion meta file — gives the progress endpoint a denominator
+        # decoupled from in-memory state. Written once at entry, after
+        # the gate, before any per-agent work. Count of "active" agents
+        # mirrors the per-agent skip in the loop body: an activity
+        # record must exist AND ``activity_level >= 0.1`` (silent-
+        # observer threshold). Best-effort: a write failure here logs a
+        # warning but never aborts the run.
+        try:
+            total_active_agents = sum(
+                1
+                for p in profiles
+                if (
+                    (a := activity_by_user_id.get(p.user_id)) is not None
+                    and a.activity_level >= 0.1
+                )
+            )
+            jsonl_logger.project_dir.mkdir(parents=True, exist_ok=True)
+            meta_path = jsonl_logger.project_dir / "agent_research.meta.json"
+            meta_payload = {
+                "total_active_agents": total_active_agents,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta_payload, f, ensure_ascii=False)
+        except OSError as exc:
+            logger.warning("research meta file write failed: %s", exc)
 
         for profile in profiles:
             activity = activity_by_user_id.get(profile.user_id)
