@@ -162,6 +162,53 @@ def get_entities_by_type(graph_id: str, entity_type: str):
 
 # ============== 模拟管理接口 ==============
 
+
+def _validate_research_fields(data: dict):
+    """Validate the two operator-visible web-research fields on a request body.
+
+    Policy (Critical decisions §1 + §2):
+        * ``research_enabled``: strict-bool. ``isinstance(x, bool)`` is the
+          gate — JSON ``true`` / ``false`` parses to Python ``bool``; a
+          string ``"true"`` is a client bug and returns HTTP 400.
+        * ``research_base_k``: clamp to
+          ``[1, MAX_RESEARCH_QUERIES_PER_AGENT]`` (env-driven, default 20).
+          Reject only if the value is not an ``int`` (or a ``bool``, which
+          ``isinstance(bool, int)`` accepts but is not a meaningful K) — clamp
+          out-of-range integers silently.
+
+    Returns:
+        A ``dict`` of validated kwargs to forward to the manager (only contains
+        keys that were present on ``data``), OR a ``(response, status_code)``
+        Flask error tuple ready to ``return`` on validation failure.
+    """
+    kwargs: dict = {}
+
+    if "research_enabled" in data:
+        value = data["research_enabled"]
+        # ``isinstance(x, bool)`` excludes ``int`` — strict-bool enforces the
+        # JSON-bool-only contract documented in the request schema.
+        if not isinstance(value, bool):
+            return jsonify({
+                "success": False,
+                "error": t('api.invalidResearchEnabled'),
+            }), 400
+        kwargs["research_enabled"] = value
+
+    if "research_base_k" in data:
+        value = data["research_base_k"]
+        # Reject ``bool`` explicitly (``True`` / ``False`` are ``int`` subtypes
+        # in Python; passing them as K is almost certainly a client bug).
+        if isinstance(value, bool) or not isinstance(value, int):
+            return jsonify({
+                "success": False,
+                "error": t('api.invalidResearchBaseK'),
+            }), 400
+        max_k = int(os.getenv('MAX_RESEARCH_QUERIES_PER_AGENT', '20'))
+        kwargs["research_base_k"] = max(1, min(value, max_k))
+
+    return kwargs
+
+
 @simulation_bp.route('/create', methods=['POST'])
 def create_simulation():
     """
@@ -177,7 +224,10 @@ def create_simulation():
             "enable_reddit": true,            // 可选，默认true
             "builder_model_name": "gpt-4o",   // 可选，UI 持久化字段，默认 ""
             "swarm_model_name": "qwen-plus",  // 可选，UI 持久化字段，默认 ""
-            "judge_model_name": ""            // 可选，UI 持久化字段，默认 ""
+            "judge_model_name": "",           // 可选，UI 持久化字段，默认 ""
+            "research_enabled": false,        // 可选，UI 持久化字段，默认 false（严格 bool）
+            "research_base_k": 3              // 可选，UI 持久化字段，默认 3，
+                                              //   会被夹紧到 [1, MAX_RESEARCH_QUERIES_PER_AGENT]
         }
 
     模型字段语义（v1 仅持久化，不参与运行时解析）：
@@ -185,6 +235,13 @@ def create_simulation():
         表示该角色继承全局 ``LLM_*`` 配置（由 ``Config.llm_for(role)`` 在进程
         启动时从 ``BUILDER_LLM_*`` / ``SWARM_LLM_*`` / ``JUDGE_LLM_*`` 环境
         变量解析）。本端点仅负责持久化，不会修改运行时 LLM 选择路径。
+
+    研究字段语义（v1 仅持久化，不参与运行时解析）：
+        ``research_enabled`` / ``research_base_k`` 为操作员可见的 UI 持久化字段，
+        运行时门控仍由 ``RESEARCH_ENABLED`` 环境变量驱动
+        （``AgentResearchService.is_enabled()`` 在进程启动时读取），
+        预算上限仍由 ``MAX_RESEARCH_QUERIES_PER_AGENT`` 环境变量驱动
+        （``AgentResearchService.budget()``）。本端点仅负责持久化。
 
     返回：
         {
@@ -199,34 +256,47 @@ def create_simulation():
                 "builder_model_name": "gpt-4o",
                 "swarm_model_name": "qwen-plus",
                 "judge_model_name": "",
+                "research_enabled": false,
+                "research_base_k": 3,
                 "created_at": "2025-12-01T10:00:00"
             }
         }
     """
     try:
         data = request.get_json() or {}
-        
+
         project_id = data.get('project_id')
         if not project_id:
             return jsonify({
                 "success": False,
                 "error": t('api.requireProjectId')
             }), 400
-        
+
         project = ProjectManager.get_project(project_id)
         if not project:
             return jsonify({
                 "success": False,
                 "error": t('api.projectNotFound', id=project_id)
             }), 404
-        
+
         graph_id = data.get('graph_id') or project.graph_id
         if not graph_id:
             return jsonify({
                 "success": False,
                 "error": t('api.graphNotBuilt')
             }), 400
-        
+
+        # Bounds + type validation for the two operator-visible research
+        # fields. Strict-bool for ``research_enabled`` (JSON ``true``/``false``
+        # parses to Python ``bool``; a string ``"true"`` is a client bug we
+        # surface immediately). Clamp ``research_base_k`` to
+        # ``[1, MAX_RESEARCH_QUERIES_PER_AGENT]`` — clamp is more forgiving
+        # than reject for an integer slider value and matches the runtime
+        # budget calculator's ceiling.
+        research_kwargs = _validate_research_fields(data)
+        if isinstance(research_kwargs, tuple):
+            return research_kwargs  # already a (jsonify, status) error tuple
+
         manager = SimulationManager()
         state = manager.create_simulation(
             project_id=project_id,
@@ -236,6 +306,7 @@ def create_simulation():
             builder_model_name=data.get('builder_model_name', ''),
             swarm_model_name=data.get('swarm_model_name', ''),
             judge_model_name=data.get('judge_model_name', ''),
+            **research_kwargs,
         )
         
         return jsonify({
@@ -802,27 +873,40 @@ def get_simulation(simulation_id: str):
 
 # Partial-update endpoint, paired with the GET handler above (Flask routes by
 # the (method, path) tuple, so PATCH on the same path is a distinct route).
-# Scope: only the three operator-visible model-name fields. Any key absent
-# from the payload is left untouched (sentinel ``None`` at the manager).
-_UPDATABLE_MODEL_FIELDS = ("builder_model_name", "swarm_model_name", "judge_model_name")
+# Scope: the three operator-visible model-name fields plus the two
+# operator-visible research fields. Any key absent from the payload is left
+# untouched (sentinel ``None`` at the manager). The tuple keeps its T-004
+# name for diff minimality; a future cleanup TD may rename to
+# ``_UPDATABLE_FIELDS``.
+_UPDATABLE_MODEL_FIELDS = (
+    "builder_model_name",
+    "swarm_model_name",
+    "judge_model_name",
+    "research_enabled",
+    "research_base_k",
+)
 
 
 @simulation_bp.route('/<simulation_id>', methods=['PATCH'])
 def update_simulation(simulation_id: str):
     """
-    部分更新模拟的 UI-persisted 模型字段
+    部分更新模拟的 UI-persisted 字段
 
     请求（JSON）：
         任意一个或多个：
         {
             "builder_model_name": "gpt-4o",
             "swarm_model_name": "qwen-plus",
-            "judge_model_name": ""
+            "judge_model_name": "",
+            "research_enabled": true,
+            "research_base_k": 5
         }
 
     语义：
         * 字段缺省 ⇒ 不修改持久化值
-        * 字段为 ""  ⇒ 该角色继承全局 LLM_* 配置
+        * 字段为 ""  ⇒ 该角色继承全局 LLM_* 配置（仅适用于三个 ``*_model_name``）
+        * ``research_enabled`` 严格 bool；``research_base_k`` 会被夹紧到
+          ``[1, MAX_RESEARCH_QUERIES_PER_AGENT]``
 
     返回：
         {"success": true, "data": <state.to_dict()>}
@@ -830,9 +914,24 @@ def update_simulation(simulation_id: str):
     try:
         data = request.get_json() or {}
 
+        # Apply the same bounds + type validation as POST ``/create`` so the
+        # PATCH surface cannot be used to bypass strict-bool / clamp policy.
+        # ``_validate_research_fields`` returns a (response, status) tuple on
+        # error or a kwargs dict on success.
+        validated_research = _validate_research_fields(data)
+        if isinstance(validated_research, tuple):
+            return validated_research
+
         # Filter on key presence, not value truthiness — explicit ""
-        # is meaningful (= "set to inherit") and must reach the manager.
-        kwargs = {key: data[key] for key in _UPDATABLE_MODEL_FIELDS if key in data}
+        # is meaningful (= "set to inherit") for the three ``*_model_name``
+        # fields and must reach the manager. The two research fields come
+        # from the validator above (already type-checked + clamped).
+        kwargs = {
+            key: data[key]
+            for key in _UPDATABLE_MODEL_FIELDS
+            if key in data and key not in ("research_enabled", "research_base_k")
+        }
+        kwargs.update(validated_research)
 
         manager = SimulationManager()
         state = manager.update_simulation(simulation_id, **kwargs)

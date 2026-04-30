@@ -41,6 +41,55 @@
         </div>
       </div>
 
+      <!-- Web Research config card (operator-visible UI persistence; runtime gate stays the RESEARCH_ENABLED env var) -->
+      <div class="step-card">
+        <div class="card-header">
+          <div class="step-info">
+            <span class="step-title">{{ $t('step2.webResearchTitle') }}</span>
+          </div>
+        </div>
+
+        <div class="card-content">
+          <p class="description">{{ $t('step2.webResearchDesc') }}</p>
+
+          <label class="switch-control">
+            <input type="checkbox" v-model="researchSettings.enabled">
+            <span class="switch-track"></span>
+            <span class="switch-label">{{ $t('step2.enableResearchToggle') }}</span>
+          </label>
+
+          <Transition name="fade">
+            <div v-if="researchSettings.enabled" class="rounds-content">
+              <div class="slider-display">
+                <div class="slider-main-value">
+                  <span class="val-num">{{ researchSettings.baseK }}</span>
+                  <span class="val-unit">{{ $t('step2.researchKUnit') }}</span>
+                </div>
+                <div class="slider-meta-info">
+                  <span>{{ $t('step2.researchKSlider') }}</span>
+                </div>
+              </div>
+
+              <div class="range-wrapper">
+                <input
+                  type="range"
+                  v-model.number="researchSettings.baseK"
+                  min="1"
+                  max="10"
+                  step="1"
+                  class="minimal-slider"
+                  :style="{ '--percent': ((researchSettings.baseK - 1) / 9) * 100 + '%' }"
+                />
+                <div class="range-marks">
+                  <span>1</span>
+                  <span>10</span>
+                </div>
+              </div>
+            </div>
+          </Transition>
+        </div>
+      </div>
+
       <!-- Step 02: 生成 Agent 人设 -->
       <div class="step-card" :class="{ 'active': phase === 1, 'completed': phase > 1 }">
         <div class="card-header">
@@ -632,14 +681,16 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   prepareSimulation,
   getPrepareStatus,
   getSimulationProfilesRealtime,
   getSimulationConfig,
-  getSimulationConfigRealtime
+  getSimulationConfigRealtime,
+  getSimulation,
+  updateSimulation
 } from '../api/simulation'
 
 const { t } = useI18n()
@@ -674,6 +725,59 @@ let lastLoggedConfigStage = ''
 // 模拟轮数配置
 const useCustomRounds = ref(false) // 默认使用自动配置轮数
 const customMaxRounds = ref(40)   // 默认推荐40轮
+
+// 网页研究配置 - 操作员可见的 UI 持久化字段。
+// 运行时门控仍由后端 RESEARCH_ENABLED env var 决定；K 的运行时上限仍由
+// MAX_RESEARCH_QUERIES_PER_AGENT env var 控制。本组件只负责往返持久化。
+const researchSettings = reactive({
+  enabled: false,
+  baseK: 3
+})
+
+// 跟踪初次回填，避免 watcher 把刚加载的值再写回后端
+let researchHydrated = false
+// debounce 句柄：拖动滑块时合并多次写入
+let researchSaveTimer = null
+
+const persistResearchSettings = () => {
+  if (!props.simulationId) return
+  if (researchSaveTimer) {
+    clearTimeout(researchSaveTimer)
+  }
+  researchSaveTimer = setTimeout(() => {
+    researchSaveTimer = null
+    // 不要 await — 失败时只记录到控制台，不阻塞 UI
+    updateSimulation(props.simulationId, {
+      research_enabled: researchSettings.enabled,
+      research_base_k: researchSettings.baseK
+    }).catch((err) => {
+      console.warn('[Step2] persist research settings failed', err)
+    })
+  }, 400)
+}
+
+// 回填：组件挂载或 simulationId 变化时，从后端读取已持久化的值
+watch(() => props.simulationId, async (id) => {
+  if (!id) return
+  try {
+    const res = await getSimulation(id)
+    const data = res?.data?.data ?? res?.data ?? {}
+    researchHydrated = false
+    researchSettings.enabled = data.research_enabled === true
+    researchSettings.baseK = Number.isFinite(data.research_base_k) ? data.research_base_k : 3
+    // 等下一个 tick 让 reactive 赋值落地后再开启写回
+    nextTick(() => { researchHydrated = true })
+  } catch (err) {
+    console.warn('[Step2] load research settings failed', err)
+    researchHydrated = true
+  }
+}, { immediate: true })
+
+// 写回：用户改动后 debounced 推送到后端
+watch(researchSettings, () => {
+  if (!researchHydrated) return
+  persistResearchSettings()
+}, { deep: true })
 
 // Watch stage to update phase
 watch(currentStage, (newStage) => {

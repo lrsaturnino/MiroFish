@@ -118,6 +118,19 @@ class SimulationState:
     # Empty string ⇒ inherit LLM_*.
     judge_model_name: str = ""
 
+    # UI-persisted operator-visible toggle for web research. Persistence-only:
+    # the runtime gate continues to be the ``RESEARCH_ENABLED`` env var read
+    # by ``AgentResearchService.is_enabled()`` at process start. A future
+    # task may bridge this UI flag into the runtime resolver; for now it is
+    # round-tripped between the operator's UI and ``state.json`` only.
+    research_enabled: bool = False
+    # UI-persisted operator-visible base K for per-agent research queries.
+    # Slider range 1–10 in the UI; the absolute runtime ceiling stays
+    # ``MAX_RESEARCH_QUERIES_PER_AGENT`` (env-driven, default 20) enforced
+    # by ``AgentResearchService.budget()``. Persistence-only; the runtime
+    # budget calculator does not consume this field directly.
+    research_base_k: int = 3
+
     def to_dict(self) -> Dict[str, Any]:
         """完整状态字典（内部使用）"""
         return {
@@ -141,6 +154,8 @@ class SimulationState:
             "builder_model_name": self.builder_model_name,
             "swarm_model_name": self.swarm_model_name,
             "judge_model_name": self.judge_model_name,
+            "research_enabled": self.research_enabled,
+            "research_base_k": self.research_base_k,
         }
     
     def to_simple_dict(self) -> Dict[str, Any]:
@@ -213,7 +228,17 @@ class SimulationManager:
         
         with open(state_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
+        # Safe null-coercion for the two typed-non-string research fields:
+        # explicit JSON ``null`` collapses to the declared default, but a
+        # legitimate persisted ``False`` / ``0`` is preserved. The unsafe
+        # ``or default`` shortcut would silently rewrite ``False`` → ``False``
+        # (harmless coincidence) and ``0`` → ``3`` (data corruption against
+        # a hand-edited state.json). Don't take the test-passing shortcut;
+        # the contract is corruption-resistance.
+        raw_research_enabled = data.get("research_enabled")
+        raw_research_base_k = data.get("research_base_k")
+
         state = SimulationState(
             simulation_id=simulation_id,
             project_id=data.get("project_id", ""),
@@ -240,6 +265,8 @@ class SimulationManager:
             builder_model_name=data.get("builder_model_name") or "",
             swarm_model_name=data.get("swarm_model_name") or "",
             judge_model_name=data.get("judge_model_name") or "",
+            research_enabled=raw_research_enabled if raw_research_enabled is not None else False,
+            research_base_k=raw_research_base_k if raw_research_base_k is not None else 3,
         )
         
         self._simulations[simulation_id] = state
@@ -254,6 +281,8 @@ class SimulationManager:
         builder_model_name: str = "",
         swarm_model_name: str = "",
         judge_model_name: str = "",
+        research_enabled: bool = False,
+        research_base_k: int = 3,
     ) -> SimulationState:
         """
         创建新的模拟
@@ -270,6 +299,13 @@ class SimulationManager:
                 Empty string ⇒ inherit from ``Config.llm_for("swarm")``.
             judge_model_name: UI-persisted operator hint for the JUDGE role.
                 Empty string ⇒ inherit from ``Config.llm_for("judge")``.
+            research_enabled: UI-persisted operator-visible web research toggle.
+                Persistence-only — does not gate the runtime pipeline. The
+                runtime gate stays the ``RESEARCH_ENABLED`` env var consumed
+                by ``AgentResearchService.is_enabled()``.
+            research_base_k: UI-persisted base K for per-agent research
+                queries. Persistence-only; the runtime budget calculator is
+                governed by ``MAX_RESEARCH_QUERIES_PER_AGENT`` env var.
 
         Returns:
             SimulationState
@@ -287,6 +323,8 @@ class SimulationManager:
             builder_model_name=builder_model_name,
             swarm_model_name=swarm_model_name,
             judge_model_name=judge_model_name,
+            research_enabled=research_enabled,
+            research_base_k=research_base_k,
         )
 
         self._save_simulation_state(state)
@@ -301,16 +339,21 @@ class SimulationManager:
         builder_model_name: Optional[str] = None,
         swarm_model_name: Optional[str] = None,
         judge_model_name: Optional[str] = None,
+        research_enabled: Optional[bool] = None,
+        research_base_k: Optional[int] = None,
     ) -> SimulationState:
-        """Partial update of the three operator-visible model-name fields.
+        """Partial update of the operator-visible UI-persisted fields.
 
         Sentinel discipline:
             * ``None``  → "do not touch this field"
-            * ``""``    → "set this field to inherit from ``LLM_*``"
+            * ``""``    → (string fields only) "set this field to inherit
+                          from ``LLM_*``"
 
         This is the only place where ``None`` and ``""`` carry different
-        meanings. Callers that want to clear a field must pass ``""``
+        meanings. Callers that want to clear a string field must pass ``""``
         explicitly; omitting the kwarg leaves the persisted value untouched.
+        For the research bool / int fields the only "do-not-touch" sentinel
+        is ``None`` — there is no analogue of the empty-string clear path.
 
         Example:
             ``manager.update_simulation("sim_abc", swarm_model_name="haiku")``
@@ -325,6 +368,10 @@ class SimulationManager:
                 the persisted value unchanged.
             judge_model_name: New JUDGE role hint, or ``None`` to leave
                 the persisted value unchanged.
+            research_enabled: New web-research toggle value, or ``None`` to
+                leave the persisted value unchanged.
+            research_base_k: New per-agent research base K, or ``None`` to
+                leave the persisted value unchanged.
 
         Returns:
             The updated ``SimulationState``.
@@ -342,6 +389,10 @@ class SimulationManager:
             state.swarm_model_name = swarm_model_name
         if judge_model_name is not None:
             state.judge_model_name = judge_model_name
+        if research_enabled is not None:
+            state.research_enabled = research_enabled
+        if research_base_k is not None:
+            state.research_base_k = research_base_k
 
         self._save_simulation_state(state)
         return state
