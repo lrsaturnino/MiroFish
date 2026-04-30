@@ -85,6 +85,18 @@
                   <span>10</span>
                 </div>
               </div>
+
+              <div class="cost-estimator">
+                <span class="estimator-line">
+                  {{ $t('step2.estimatorCostLine', {
+                    cost: researchCostUsd,
+                    minutesLabel: researchEstimatedMinutesLabel
+                  }) }}
+                </span>
+                <small v-if="researchEstimatorShowEmptyHint" class="estimator-hint">
+                  {{ $t('step2.estimatorEmptyHint') }}
+                </small>
+              </div>
             </div>
           </Transition>
         </div>
@@ -693,6 +705,35 @@ import {
   updateSimulation
 } from '../api/simulation'
 
+// --- Web Research live cost estimator constants ---------------------------
+// Tavily list price ~$0.005/query (planning §10.1).
+const TAVILY_UNIT_COST_USD = 0.005
+// Average per-query latency ~0.5s — planning §9.2: per-agent search loop is
+// intentionally serial (no inner asyncio.gather), so wall-clock ≈ queries × 0.5s.
+const SECONDS_PER_QUERY_ESTIMATE = 0.5
+// Mirrors backend env default for MAX_RESEARCH_QUERIES_PER_AGENT (planning §10.5).
+// Frontend cannot read backend env vars at build time; if the operator overrides
+// the env to a value below 20, the displayed estimate may slightly overstate cost.
+const MAX_RESEARCH_QUERIES_PER_AGENT_DEFAULT = 20
+// Silent-observer skip threshold — mirrors backend agent_research_service.py
+// (`activity_level < 0.1` returns budget 0).
+const ACTIVITY_OBSERVER_THRESHOLD = 0.1
+
+// JS port of the Python `budget()` helper. Same three-step formula: skip
+// observers, then clamp `round(baseK * influenceWeight)` to [1, max].
+// Note: JS `Math.round` is round-half-away-from-zero; Python 3 `round()` is
+// banker's. At exact half-values this diverges by ±1 query; accepted for the
+// estimator (display is `~$X.XX`, not exact).
+function budgetForAgent(influenceWeight, activityLevel, baseK) {
+  if (!Number.isFinite(activityLevel) || activityLevel < ACTIVITY_OBSERVER_THRESHOLD) {
+    return 0
+  }
+  const weight = Number.isFinite(influenceWeight) ? influenceWeight : 1
+  const k = Number.isFinite(baseK) ? baseK : 0
+  const raw = Math.round(k * weight)
+  return Math.max(1, Math.min(raw, MAX_RESEARCH_QUERIES_PER_AGENT_DEFAULT))
+}
+
 const { t } = useI18n()
 
 const props = defineProps({
@@ -837,6 +878,49 @@ const totalTopicsCount = computed(() => {
   return profiles.value.reduce((sum, p) => {
     return sum + (p.interested_topics?.length || 0)
   }, 0)
+})
+
+// --- Web Research cost estimator -----------------------------------------
+// Source of truth: simulationConfig.value.agent_configs[] (NOT profiles.value).
+// OasisAgentProfile rows do not carry influence_weight / activity_level —
+// those live on AgentActivityConfig produced by SimulationConfigGenerator.
+const researchAgentConfigs = computed(() => simulationConfig.value?.agent_configs ?? [])
+
+const totalResearchQueries = computed(() => {
+  return researchAgentConfigs.value.reduce((sum, agent) => {
+    return sum + budgetForAgent(
+      agent?.influence_weight,
+      agent?.activity_level,
+      researchSettings.baseK
+    )
+  }, 0)
+})
+
+const researchCostUsd = computed(() => {
+  return (totalResearchQueries.value * TAVILY_UNIT_COST_USD).toFixed(2)
+})
+
+// Returns one of three forms:
+//   "<1 minute"     — when total seconds < 60 (AC #6 floor)
+//   "~1 minute"     — singular boundary (60s exactly → ceil = 1)
+//   "~N minutes"    — plural for N ≥ 2
+// The "~" prefix lives inside the label so the i18n template adds it once
+// only for the cost ("~$X.XX"), never doubling on the minutes side.
+const researchEstimatedMinutesLabel = computed(() => {
+  const seconds = totalResearchQueries.value * SECONDS_PER_QUERY_ESTIMATE
+  if (seconds < 60) {
+    return t('step2.estimatorMinuteSubminute')
+  }
+  const minutes = Math.ceil(seconds / 60)
+  const key = minutes === 1 ? 'step2.estimatorMinuteSingular' : 'step2.estimatorMinutePlural'
+  return t(key, { minutes })
+})
+
+// Hint copy applies only when no profiles have been generated yet (decisions §4).
+// Distinct from "all observers skipped" — when the table IS loaded but every
+// agent is below the activity threshold, total = 0 but the hint stays hidden.
+const researchEstimatorShowEmptyHint = computed(() => {
+  return researchAgentConfigs.value.length === 0
 })
 
 // Methods
@@ -2567,6 +2651,31 @@ onUnmounted(() => {
   font-size: 10px;
   color: #94A3B8;
   position: relative;
+}
+
+/* Web Research live cost estimator — sits inline under the K slider */
+.cost-estimator {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 16px;
+  padding: 8px 10px;
+  background: #F8FAFC;
+  border-radius: 4px;
+  border-left: 2px solid #E2E8F0;
+}
+
+.cost-estimator .estimator-line {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: #1F2937;
+  font-weight: 500;
+}
+
+.cost-estimator .estimator-hint {
+  font-size: 10px;
+  color: #94A3B8;
+  font-style: italic;
 }
 
 .mark-recommend {
