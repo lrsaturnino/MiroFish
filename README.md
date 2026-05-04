@@ -127,6 +127,28 @@ LLM_MODEL_NAME=qwen-plus
 ZEP_API_KEY=your_zep_api_key
 ```
 
+**Optional: Role-scoped LLM credentials**
+
+Different stages of a simulation have different reasoning needs. You can optionally point each stage at its own LLM by setting role-prefixed env vars: BUILDER (heavy reasoning during agent profile build), SWARM (bulk OASIS simulation across the full agent population), and JUDGE (the final ReACT report agent). Each role falls back per-field to the global `LLM_*` values, so partial overrides are supported — set only what you want to change.
+
+```env
+BUILDER_LLM_API_KEY=
+BUILDER_LLM_BASE_URL=
+BUILDER_LLM_MODEL_NAME=
+SWARM_LLM_API_KEY=
+SWARM_LLM_BASE_URL=
+SWARM_LLM_MODEL_NAME=
+JUDGE_LLM_API_KEY=
+JUDGE_LLM_BASE_URL=
+JUDGE_LLM_MODEL_NAME=
+```
+
+Set none of these to keep current behavior.
+
+**Optional: Pre-simulation web research**
+
+You can enable a pre-simulation research stage that pulls fresh web context via the Tavily API before the simulation starts. Opt in by setting `RESEARCH_ENABLED=true` and providing `TAVILY_API_KEY`. The feature is default-off; with the default settings it adds approximately $0.60 per simulation in research costs.
+
 #### 2. Install Dependencies
 
 ```bash

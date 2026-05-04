@@ -5,7 +5,7 @@ LLM客户端封装
 
 import json
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Literal, Dict, Any, List
 from openai import OpenAI
 
 from ..config import Config
@@ -20,10 +20,35 @@ class LLMClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        role: Optional[Literal["builder", "swarm", "judge"]] = None,
     ):
-        self.api_key = api_key or Config.LLM_API_KEY
-        self.base_url = base_url or Config.LLM_BASE_URL
-        self.model = model or Config.LLM_MODEL_NAME
+        """
+        构造LLM客户端，按优先级解析凭据来源。
+
+        凭据解析优先级（每个字段独立）：显式kwarg > role分组 > 全局 LLM_*。
+        当 ``role`` 提供时，未显式传入的字段经由 ``Config.llm_for(role)``
+        解析；不提供 ``role`` 时退回原有的 ``Config.LLM_*`` 行为。
+
+        Args:
+            api_key: 显式 API key，优先级最高
+            base_url: 显式 base URL，优先级最高
+            model: 显式模型名，优先级最高
+            reasoning_effort: 推理强度（仅GPT-5/o系列模型支持）
+            role: ``"builder"`` / ``"swarm"`` / ``"judge"`` 之一；触发
+                按角色分组的 ``BUILDER_LLM_*`` / ``SWARM_LLM_*`` /
+                ``JUDGE_LLM_*`` 环境变量解析
+
+        Example:
+            >>> LLMClient(role="builder")  # 使用 BUILDER_LLM_* 环境变量
+        """
+        # Precedence: explicit kwarg > role group > global LLM_*
+        if role is not None:
+            role_key, role_url, role_model = Config.llm_for(role)
+        else:
+            role_key = role_url = role_model = None
+        self.api_key = api_key or role_key or Config.LLM_API_KEY
+        self.base_url = base_url or role_url or Config.LLM_BASE_URL
+        self.model = model or role_model or Config.LLM_MODEL_NAME
         # Empty string is treated as "omit the param" so providers that don't
         # accept reasoning_effort (Qwen, DeepSeek, older OpenAI models) still work.
         effort = reasoning_effort if reasoning_effort is not None else Config.LLM_REASONING_EFFORT

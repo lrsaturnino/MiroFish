@@ -41,6 +41,93 @@
         </div>
       </div>
 
+      <!-- Web Research config card (operator-visible UI persistence; runtime gate stays the RESEARCH_ENABLED env var) -->
+      <div class="step-card">
+        <div class="card-header">
+          <div class="step-info">
+            <span class="step-title">{{ $t('step2.webResearchTitle') }}</span>
+          </div>
+        </div>
+
+        <div class="card-content">
+          <p class="description">{{ $t('step2.webResearchDesc') }}</p>
+
+          <label class="switch-control">
+            <input type="checkbox" v-model="researchSettings.enabled">
+            <span class="switch-track"></span>
+            <span class="switch-label">{{ $t('step2.enableResearchToggle') }}</span>
+          </label>
+
+          <Transition name="fade">
+            <div v-if="researchSettings.enabled" class="rounds-content">
+              <div class="slider-display">
+                <div class="slider-main-value">
+                  <span class="val-num">{{ researchSettings.baseK }}</span>
+                  <span class="val-unit">{{ $t('step2.researchKUnit') }}</span>
+                </div>
+                <div class="slider-meta-info">
+                  <span>{{ $t('step2.researchKSlider') }}</span>
+                </div>
+              </div>
+
+              <div class="range-wrapper">
+                <input
+                  type="range"
+                  v-model.number="researchSettings.baseK"
+                  min="1"
+                  max="10"
+                  step="1"
+                  class="minimal-slider"
+                  :style="{ '--percent': ((researchSettings.baseK - 1) / 9) * 100 + '%' }"
+                />
+                <div class="range-marks">
+                  <span>1</span>
+                  <span>10</span>
+                </div>
+              </div>
+
+              <div class="cost-estimator">
+                <span class="estimator-line">
+                  {{ $t('step2.estimatorCostLine', {
+                    cost: researchCostUsd,
+                    minutesLabel: researchEstimatedMinutesLabel
+                  }) }}
+                </span>
+                <small v-if="researchEstimatorShowEmptyHint" class="estimator-hint">
+                  {{ $t('step2.estimatorEmptyHint') }}
+                </small>
+              </div>
+
+              <!-- Per-agent research progress bar. Visible only after
+                   the meta file is written (total > 0); polling starts
+                   when the prepare flow kicks off and the toggle is on. -->
+              <div v-if="researchProgress.total > 0" class="research-progress">
+                <div class="research-progress-header">
+                  <span class="research-progress-counts">
+                    {{ researchProgress.processed }} / {{ researchProgress.total }}
+                  </span>
+                  <span class="research-progress-percent">
+                    {{ researchProgressPercent.toFixed(0) }}%
+                  </span>
+                </div>
+                <div class="research-progress-track">
+                  <div
+                    class="research-progress-fill"
+                    :style="{ width: researchProgressPercent + '%' }"
+                  ></div>
+                </div>
+                <small
+                  v-if="researchProgress.lastAgentId !== null && researchProgress.lastAgentId !== undefined"
+                  class="research-progress-last"
+                >
+                  agent {{ researchProgress.lastAgentId }}
+                </small>
+              </div>
+            </div>
+          </Transition>
+        </div>
+      </div>
+
       <!-- Step 02: 生成 Agent 人设 -->
       <div class="step-card" :class="{ 'active': phase === 1, 'completed': phase > 1 }">
         <div class="card-header">
@@ -632,15 +719,47 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   prepareSimulation,
   getPrepareStatus,
   getSimulationProfilesRealtime,
   getSimulationConfig,
-  getSimulationConfigRealtime
+  getSimulationConfigRealtime,
+  getSimulation,
+  updateSimulation
 } from '../api/simulation'
+import { getResearchProgress } from '../api/research'
+
+// --- Web Research live cost estimator constants ---------------------------
+// Tavily list price ~$0.005/query (planning §10.1).
+const TAVILY_UNIT_COST_USD = 0.005
+// Average per-query latency ~0.5s — planning §9.2: per-agent search loop is
+// intentionally serial (no inner asyncio.gather), so wall-clock ≈ queries × 0.5s.
+const SECONDS_PER_QUERY_ESTIMATE = 0.5
+// Mirrors backend env default for MAX_RESEARCH_QUERIES_PER_AGENT (planning §10.5).
+// Frontend cannot read backend env vars at build time; if the operator overrides
+// the env to a value below 20, the displayed estimate may slightly overstate cost.
+const MAX_RESEARCH_QUERIES_PER_AGENT_DEFAULT = 20
+// Silent-observer skip threshold — mirrors backend agent_research_service.py
+// (`activity_level < 0.1` returns budget 0).
+const ACTIVITY_OBSERVER_THRESHOLD = 0.1
+
+// JS port of the Python `budget()` helper. Same three-step formula: skip
+// observers, then clamp `round(baseK * influenceWeight)` to [1, max].
+// Note: JS `Math.round` is round-half-away-from-zero; Python 3 `round()` is
+// banker's. At exact half-values this diverges by ±1 query; accepted for the
+// estimator (display is `~$X.XX`, not exact).
+function budgetForAgent(influenceWeight, activityLevel, baseK) {
+  if (!Number.isFinite(activityLevel) || activityLevel < ACTIVITY_OBSERVER_THRESHOLD) {
+    return 0
+  }
+  const weight = Number.isFinite(influenceWeight) ? influenceWeight : 1
+  const k = Number.isFinite(baseK) ? baseK : 0
+  const raw = Math.round(k * weight)
+  return Math.max(1, Math.min(raw, MAX_RESEARCH_QUERIES_PER_AGENT_DEFAULT))
+}
 
 const { t } = useI18n()
 
@@ -674,6 +793,59 @@ let lastLoggedConfigStage = ''
 // 模拟轮数配置
 const useCustomRounds = ref(false) // 默认使用自动配置轮数
 const customMaxRounds = ref(40)   // 默认推荐40轮
+
+// 网页研究配置 - 操作员可见的 UI 持久化字段。
+// 运行时门控仍由后端 RESEARCH_ENABLED env var 决定；K 的运行时上限仍由
+// MAX_RESEARCH_QUERIES_PER_AGENT env var 控制。本组件只负责往返持久化。
+const researchSettings = reactive({
+  enabled: false,
+  baseK: 3
+})
+
+// 跟踪初次回填，避免 watcher 把刚加载的值再写回后端
+let researchHydrated = false
+// debounce 句柄：拖动滑块时合并多次写入
+let researchSaveTimer = null
+
+const persistResearchSettings = () => {
+  if (!props.simulationId) return
+  if (researchSaveTimer) {
+    clearTimeout(researchSaveTimer)
+  }
+  researchSaveTimer = setTimeout(() => {
+    researchSaveTimer = null
+    // 不要 await — 失败时只记录到控制台，不阻塞 UI
+    updateSimulation(props.simulationId, {
+      research_enabled: researchSettings.enabled,
+      research_base_k: researchSettings.baseK
+    }).catch((err) => {
+      console.warn('[Step2] persist research settings failed', err)
+    })
+  }, 400)
+}
+
+// 回填：组件挂载或 simulationId 变化时，从后端读取已持久化的值
+watch(() => props.simulationId, async (id) => {
+  if (!id) return
+  try {
+    const res = await getSimulation(id)
+    const data = res?.data?.data ?? res?.data ?? {}
+    researchHydrated = false
+    researchSettings.enabled = data.research_enabled === true
+    researchSettings.baseK = Number.isFinite(data.research_base_k) ? data.research_base_k : 3
+    // 等下一个 tick 让 reactive 赋值落地后再开启写回
+    nextTick(() => { researchHydrated = true })
+  } catch (err) {
+    console.warn('[Step2] load research settings failed', err)
+    researchHydrated = true
+  }
+}, { immediate: true })
+
+// 写回：用户改动后 debounced 推送到后端
+watch(researchSettings, () => {
+  if (!researchHydrated) return
+  persistResearchSettings()
+}, { deep: true })
 
 // Watch stage to update phase
 watch(currentStage, (newStage) => {
@@ -710,6 +882,30 @@ const autoGeneratedRounds = computed(() => {
 let pollTimer = null
 let profilesTimer = null
 let configTimer = null
+let researchPollTimer = null
+// Wall-clock kick-off marker for the 10-minute safety cap. Captured the
+// moment polling first starts; the cap is enforced inside the poll
+// callback so a stale interval can never outlive the safety window.
+let researchPollStartedAt = 0
+const RESEARCH_POLL_INTERVAL_MS = 1500
+const RESEARCH_POLL_MAX_RUN_MS = 10 * 60 * 1000
+
+// Live progress state for the per-agent web-research bar. Populated by
+// the polling callback that hits `/api/research/progress/<project_id>`.
+// `total === 0` means the meta file is not present yet (research has
+// not started or is disabled) — the markup gates visibility on this.
+const researchProgress = reactive({
+  processed: 0,
+  total: 0,
+  lastAgentId: null,
+  lastTs: null
+})
+
+const researchProgressPercent = computed(() => {
+  if (!researchProgress.total) return 0
+  const pct = (researchProgress.processed / researchProgress.total) * 100
+  return Math.max(0, Math.min(100, pct))
+})
 
 // Computed
 const displayProfiles = computed(() => {
@@ -733,6 +929,49 @@ const totalTopicsCount = computed(() => {
   return profiles.value.reduce((sum, p) => {
     return sum + (p.interested_topics?.length || 0)
   }, 0)
+})
+
+// --- Web Research cost estimator -----------------------------------------
+// Source of truth: simulationConfig.value.agent_configs[] (NOT profiles.value).
+// OasisAgentProfile rows do not carry influence_weight / activity_level —
+// those live on AgentActivityConfig produced by SimulationConfigGenerator.
+const researchAgentConfigs = computed(() => simulationConfig.value?.agent_configs ?? [])
+
+const totalResearchQueries = computed(() => {
+  return researchAgentConfigs.value.reduce((sum, agent) => {
+    return sum + budgetForAgent(
+      agent?.influence_weight,
+      agent?.activity_level,
+      researchSettings.baseK
+    )
+  }, 0)
+})
+
+const researchCostUsd = computed(() => {
+  return (totalResearchQueries.value * TAVILY_UNIT_COST_USD).toFixed(2)
+})
+
+// Returns one of three forms:
+//   "<1 minute"     — when total seconds < 60 (AC #6 floor)
+//   "~1 minute"     — singular boundary (60s exactly → ceil = 1)
+//   "~N minutes"    — plural for N ≥ 2
+// The "~" prefix lives inside the label so the i18n template adds it once
+// only for the cost ("~$X.XX"), never doubling on the minutes side.
+const researchEstimatedMinutesLabel = computed(() => {
+  const seconds = totalResearchQueries.value * SECONDS_PER_QUERY_ESTIMATE
+  if (seconds < 60) {
+    return t('step2.estimatorMinuteSubminute')
+  }
+  const minutes = Math.ceil(seconds / 60)
+  const key = minutes === 1 ? 'step2.estimatorMinuteSingular' : 'step2.estimatorMinutePlural'
+  return t(key, { minutes })
+})
+
+// Hint copy applies only when no profiles have been generated yet (decisions §4).
+// Distinct from "all observers skipped" — when the table IS loaded but every
+// agent is below the activity threshold, total = 0 but the hint stays hidden.
+const researchEstimatorShowEmptyHint = computed(() => {
+  return researchAgentConfigs.value.length === 0
 })
 
 // Methods
@@ -814,6 +1053,14 @@ const startPrepareSimulation = async () => {
       startPolling()
       // 开始实时获取 Profiles
       startProfilesPolling()
+      // Kick off web-research progress polling only when the operator
+      // has enabled research AND we have a project_id to query against.
+      // The endpoint will return zeros until the meta file is written
+      // by AgentResearchService.run() — the bar stays hidden via the
+      // `total > 0` markup gate until then.
+      if (researchSettings.enabled && props.projectData?.project_id) {
+        startResearchPolling()
+      }
     } else {
       addLog(t('log.prepareFailed', { error: res.error || t('common.unknownError') }))
       emit('update-status', 'error')
@@ -964,6 +1211,57 @@ const stopConfigPolling = () => {
   }
 }
 
+// Web research progress polling. Runs while research is active; stops
+// on completion (`processed >= total > 0`), on unmount, or after the
+// 10-minute safety cap. Idempotent: calling start when already running
+// is a no-op; stop when already stopped is a no-op.
+const startResearchPolling = () => {
+  if (researchPollTimer) return
+  researchPollStartedAt = Date.now()
+  researchPollTimer = setInterval(fetchResearchProgress, RESEARCH_POLL_INTERVAL_MS)
+}
+
+const stopResearchPolling = () => {
+  if (researchPollTimer) {
+    clearInterval(researchPollTimer)
+    researchPollTimer = null
+  }
+}
+
+const fetchResearchProgress = async () => {
+  // Hard safety cap — a stuck research run cannot leak the interval
+  // past 10 minutes regardless of backend state.
+  if (Date.now() - researchPollStartedAt > RESEARCH_POLL_MAX_RUN_MS) {
+    stopResearchPolling()
+    return
+  }
+  const projectId = props.projectData?.project_id
+  if (!projectId) return
+
+  try {
+    const res = await getResearchProgress(projectId)
+    // The endpoint returns a flat body without a `success` envelope on
+    // the 200 path; the response interceptor at api/index.js passes it
+    // through unchanged (the `res.success !== undefined` guard).
+    if (res && typeof res.processed_agents === 'number') {
+      researchProgress.processed = res.processed_agents
+      researchProgress.total = res.total_active_agents
+      researchProgress.lastAgentId = res.last_agent_id
+      researchProgress.lastTs = res.last_ts
+
+      if (researchProgress.total > 0 && researchProgress.processed >= researchProgress.total) {
+        stopResearchPolling()
+      }
+    }
+  } catch (err) {
+    // 404 (project dir missing) is expected before the meta file is
+    // written for the first time; transient — keep polling unless the
+    // safety cap fires. Other errors also stay non-blocking so the bar
+    // never crashes the page.
+    console.warn('[Step2] research progress fetch failed', err)
+  }
+}
+
 const fetchConfigRealtime = async () => {
   if (!props.simulationId) return
   
@@ -1080,6 +1378,7 @@ onUnmounted(() => {
   stopPolling()
   stopProfilesPolling()
   stopConfigPolling()
+  stopResearchPolling()
 })
 </script>
 
@@ -2463,6 +2762,84 @@ onUnmounted(() => {
   font-size: 10px;
   color: #94A3B8;
   position: relative;
+}
+
+/* Web Research live cost estimator — sits inline under the K slider */
+.cost-estimator {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 16px;
+  padding: 8px 10px;
+  background: #F8FAFC;
+  border-radius: 4px;
+  border-left: 2px solid #E2E8F0;
+}
+
+.cost-estimator .estimator-line {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: #1F2937;
+  font-weight: 500;
+}
+
+.cost-estimator .estimator-hint {
+  font-size: 10px;
+  color: #94A3B8;
+  font-style: italic;
+}
+
+/* Per-agent web-research progress bar — sits under the cost estimator
+   inside the Web Research card. Visibility is gated in the template
+   on `total > 0`, so the block never renders when research is off. */
+.research-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 8px 10px;
+  background: #F8FAFC;
+  border-radius: 4px;
+  border-left: 2px solid #6366F1;
+}
+
+.research-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: #1F2937;
+}
+
+.research-progress-counts {
+  font-weight: 500;
+}
+
+.research-progress-percent {
+  color: #6366F1;
+  font-weight: 600;
+}
+
+.research-progress-track {
+  width: 100%;
+  height: 6px;
+  background: #E2E8F0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.research-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #6366F1 0%, #8B5CF6 100%);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+
+.research-progress-last {
+  font-size: 10px;
+  color: #94A3B8;
+  font-family: 'JetBrains Mono', monospace;
 }
 
 .mark-recommend {

@@ -2,10 +2,26 @@ import service, { requestWithRetry } from './index'
 
 /**
  * 创建模拟
- * @param {Object} data - { project_id, graph_id?, enable_twitter?, enable_reddit? }
+ * @param {Object} data - { project_id, graph_id?, enable_twitter?, enable_reddit?,
+ *   builder_model_name?, swarm_model_name?, judge_model_name?,
+ *   research_enabled?, research_base_k? }
  */
 export const createSimulation = (data) => {
   return requestWithRetry(() => service.post('/api/simulation/create', data), 3, 1000)
+}
+
+/**
+ * 部分更新模拟（PATCH /api/simulation/:simulationId）
+ *
+ * 仅写入 ``data`` 中明确提供的字段；缺省字段在后端不被修改。后端会对
+ * ``research_enabled`` / ``research_base_k`` 做严格 bool / 钳位校验。
+ *
+ * @param {string} simulationId
+ * @param {Object} data - { builder_model_name?, swarm_model_name?, judge_model_name?,
+ *   research_enabled?, research_base_k? }
+ */
+export const updateSimulation = (simulationId, data) => {
+  return requestWithRetry(() => service.patch(`/api/simulation/${simulationId}`, data), 3, 1000)
 }
 
 /**

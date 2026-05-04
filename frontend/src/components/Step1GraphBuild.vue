@@ -158,14 +158,35 @@
         <div class="card-content">
           <p class="api-note">POST /api/simulation/create</p>
           <p class="description">{{ $t('step1.buildCompleteDesc') }}</p>
-          <button 
-            class="action-btn" 
+          <button
+            class="action-btn"
             :disabled="currentPhase < 2 || creatingSimulation"
             @click="handleEnterEnvSetup"
           >
             <span v-if="creatingSimulation" class="spinner-sm"></span>
             {{ creatingSimulation ? $t('step1.creating') : $t('step1.enterEnvSetup') + ' ➝' }}
           </button>
+        </div>
+      </div>
+
+      <!-- Optional: Role-scoped LLM models -->
+      <div class="step-card settings-card">
+        <div class="card-header">
+          <div class="step-info">
+            <span class="step-title">{{ $t('step1.roleModelsHeading') }}</span>
+          </div>
+        </div>
+        <div class="card-content">
+          <p class="description">{{ $t('step1.roleModelsDesc') }}</p>
+          <div v-for="field in roleFields" :key="field.key" class="role-row">
+            <label class="role-label">{{ $t(field.labelKey) }}</label>
+            <input
+              type="text"
+              class="role-input"
+              v-model="roleModels[field.key]"
+              :placeholder="$t('step1.roleModelsPlaceholder')"
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -187,10 +208,10 @@
 </template>
 
 <script setup>
-import { computed, ref, watch, nextTick } from 'vue'
+import { computed, reactive, ref, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { createSimulation } from '../api/simulation'
+import { createSimulation, listSimulations } from '../api/simulation'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -210,6 +231,17 @@ const selectedOntologyItem = ref(null)
 const logContent = ref(null)
 const creatingSimulation = ref(false)
 
+// Optional role-scoped LLM model overrides. Empty string means inherit from LLM_MODEL_NAME.
+const roleModels = reactive({ builder: '', swarm: '', judge: '' })
+
+// Field metadata pairs each roleModels key with its i18n label key. Used by the
+// v-for loop in the template so the three rows share one canonical render block.
+const roleFields = [
+  { key: 'builder', labelKey: 'step1.builderModelLabel' },
+  { key: 'swarm', labelKey: 'step1.swarmModelLabel' },
+  { key: 'judge', labelKey: 'step1.judgeModelLabel' }
+]
+
 // 进入环境搭建 - 创建 simulation 并跳转
 const handleEnterEnvSetup = async () => {
   if (!props.projectData?.project_id || !props.projectData?.graph_id) {
@@ -224,7 +256,10 @@ const handleEnterEnvSetup = async () => {
       project_id: props.projectData.project_id,
       graph_id: props.projectData.graph_id,
       enable_twitter: true,
-      enable_reddit: true
+      enable_reddit: true,
+      builder_model_name: roleModels.builder,
+      swarm_model_name: roleModels.swarm,
+      judge_model_name: roleModels.judge
     })
     
     if (res.success && res.data?.simulation_id) {
@@ -270,6 +305,38 @@ watch(() => props.systemLogs.length, () => {
     }
   })
 })
+
+// Read-back: when a project_id becomes available (initial mount or late-arriving
+// projectData prop), look up the most recent simulation for this project and
+// populate the role-model inputs from it. The backend listSimulations endpoint
+// returns entries in filesystem order, NOT chronological order, so we sort by
+// created_at descending and pick the head element. ISO-8601 strings sort lexically.
+watch(
+  () => props.projectData?.project_id,
+  async (projectId) => {
+    if (!projectId) return
+    try {
+      const res = await listSimulations(projectId)
+      const list = Array.isArray(res?.data) ? res.data : []
+      const matching = list.filter(s => s?.project_id === projectId)
+      if (matching.length === 0) return
+      const sorted = [...matching].sort((a, b) => {
+        const aTs = a?.created_at || ''
+        const bTs = b?.created_at || ''
+        if (aTs > bTs) return -1
+        if (aTs < bTs) return 1
+        return 0
+      })
+      const latest = sorted[0]
+      roleModels.builder = latest?.builder_model_name ?? ''
+      roleModels.swarm = latest?.swarm_model_name ?? ''
+      roleModels.judge = latest?.judge_model_name ?? ''
+    } catch (err) {
+      console.warn('Failed to load existing role-model selections:', err)
+    }
+  },
+  { immediate: true }
+)
 </script>
 
 <style scoped>
@@ -696,5 +763,43 @@ watch(() => props.systemLogs.length, () => {
 .log-msg {
   color: #CCC;
   word-break: break-all;
+}
+
+/* Optional Role-scoped LLM model overrides */
+.role-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.role-row:last-child {
+  margin-bottom: 0;
+}
+
+.role-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: #555;
+  min-width: 72px;
+  letter-spacing: 0.5px;
+}
+
+.role-input {
+  flex: 1;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid #EAEAEA;
+  border-radius: 4px;
+  background: #FAFAFA;
+  color: #333;
+}
+
+.role-input:focus {
+  outline: none;
+  border-color: #FF5722;
+  background: #FFF;
 }
 </style>
